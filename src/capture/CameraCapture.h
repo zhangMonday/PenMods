@@ -8,8 +8,14 @@
 
 #include "mod/Config.h"
 
+#include <QByteArray>
+#include <QHash>
+#include <QPair>
+#include <QRect>
+#include <QSize>
 #include <QString>
 #include <QStringList>
+#include <QThreadPool>
 #include <atomic>
 
 namespace mod::capture {
@@ -62,10 +68,28 @@ private:
     friend Singleton<CameraCapture>;
     explicit CameraCapture();
 
+    // Scan frames are validated (cheap, header only) on the capture thread and then
+    // decoded/cropped/re-encoded on mScanPool. Every result walks through
+    // emitScanResult() so imageCaptured/captureFailed stay in scan order even if a
+    // frame had to be processed inline.
+    void dispatchScanFrame(quint64 seq, QByteArray rawData, const QRect& cropRect);
+    void processScanFrame(quint64 seq, const QByteArray& rawData, const QRect& cropRect);
+    void postScanResult(quint64 seq, const QString& data, const QString& error);
+    void emitScanResult(quint64 seq, const QString& data, const QString& error);
+
     std::string      mClassName = "capture";
     json             mCfg;
     std::atomic_bool mCaptureEnabled{false};
     std::atomic_int  mDefaultCropMode{1};
+
+    // One worker only: QThreadPool runs queued tasks in submission order, so frames
+    // complete in capture order and at most one decoded frame is alive at a time.
+    QThreadPool          mScanPool;
+    std::atomic<qint64>  mPendingScanBytes{0};
+    std::atomic<quint64> mScanSeq{0};
+    // UI-thread only: results waiting for their predecessor so emission order == scan order.
+    quint64                                 mNextScanEmit = 0;
+    QHash<quint64, QPair<QString, QString>> mPendingScanResults;
 };
 
 } // namespace mod::capture

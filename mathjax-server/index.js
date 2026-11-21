@@ -423,6 +423,36 @@ class RateLimiter {
 const renderMutex = new Mutex();
 const rateLimiter = new RateLimiter(1000, RATE_LIMIT_PER_SECOND);
 
+// --- 渲染结果 LRU 缓存（按请求输入） ---
+// 客户端每个进程维护自己的公式缓存，但应用重启、或另一条会话重新打开时，同一段回答里的
+// 公式会原样再请求一遍。这里按"影响输出的全部输入"缓存响应体，命中时直接回上次的响应，
+// 省掉一次 MathJax 转换和一次 resvg 光栅化 —— 后者最贵：resvg-js 2.6.2 的每个 Resvg 实例
+// 都要重新装载系统字体（实测 x86 上 loadSystemFonts:true 约 13ms，同一张图关掉后 0.2ms），
+// 设备上的字体文件更多、更慢。
+//
+// 键必须覆盖所有影响输出的输入：latex、display、屏幕宽高（决定 maxW 与 containerWidth）、
+// 颜色，以及字体状态（启动探测定下来之后就固定了，仍然放进键里，免得 pending 期间算出的
+// 结果在字体状态切换后被复用）。输出尺寸规则与 RENDERER_VERSION 都不受影响。
+const RENDER_CACHE_MAX = 160;      // 160 条响应；实测单条 1.2–24 KB，满盘约 1.5–3 MB
+const renderCache = new Map();     // Map 保持插入顺序：重插即"最近使用"，头部即最久未用
+function renderCacheKey(latex, display, sw, sh, color) {
+    return [latex, display ? 1 : 0, sw, sh, color, fontState.status, fontState.family || ''].join('\u0001');
+}
+function renderCacheGet(key) {
+    const hit = renderCache.get(key);
+    if (hit === undefined) return null;
+    renderCache.delete(key);
+    renderCache.set(key, hit);
+    return hit;
+}
+function renderCachePut(key, value) {
+    renderCache.set(key, value);
+    while (renderCache.size > RENDER_CACHE_MAX) {
+        renderCache.delete(renderCache.keys().next().value);
+    }
+    return value;
+}
+
 /**
  * 解析 SVG 中以 ex 为单位的原始宽高。
  * MathJax 输出：<svg width="1.294ex" height="1.025ex" viewBox="...">
@@ -1128,12 +1158,28 @@ async function main() {
         const sw = Math.max(Math.round(screenWidth), MIN_PNG_DIM);
         const sh = Math.max(Math.round(screenHeight), MIN_PNG_DIM);
 
+        // 完全相同的一次渲染（同式子/同宽度/同颜色/同字体状态）直接复用上次的响应体。
+        const cacheKey = renderCacheKey(latex, display, sw, sh, color);
+        const cachedResponse = renderCacheGet(cacheKey);
+        if (cachedResponse) {
+            log(`缓存命中：latex="${latex.slice(0, 30)}" (${clientIp})`);
+            return res.status(200).json(cachedResponse);
+        }
+
         await renderMutex.acquire();
         try {
             const maxW = Math.min(sw - 20, MAX_RENDER_WIDTH);
 
             // MathJax 渲染成 SVG（尺寸度量与出图共用同一次转换）
+            // 同一次请求里同一个式子往往要转换好几次（换行算法按实测宽度反复量：实测一条
+            // 79 项的加法链调用 41 次，去重后只有 25 个不同输入）。转换是纯函数（只依赖
+            // latex、display 以及本请求的容器宽度/颜色/字体状态），所以按两者记忆即可，
+            // 输出与逐次转换字节一致，只是少算几遍。
+            const svgMemo = new Map();
             const renderSvg = (latexText, isDisplay) => {
+                const memoKey = (isDisplay ? 'D' : 'I') + '\u0000' + latexText;
+                const memoized = svgMemo.get(memoKey);
+                if (memoized !== undefined) return memoized;
                 const containerNode = mathjaxDocument.convert(latexText, {
                     display: isDisplay,
                     em: REF_EM,
@@ -1147,7 +1193,9 @@ async function main() {
                 // 只有显式字体文件才改写 <text> 的 font-family（指到该字体的真实 family）。
                 // 系统字体模式下保持 MathJax 原样：font-family="serif" 由 fontconfig 解析，
                 // 缺字时 resvg 还会逐字回退到装得下的中文字体（真机上实测正常）。
-                return fontState.status === 'file' ? applyCjkFamily(svg, fontState.family) : svg;
+                const out = fontState.status === 'file' ? applyCjkFamily(svg, fontState.family) : svg;
+                if (svgMemo.size < 512) svgMemo.set(memoKey, out);
+                return out;
             };
             const svgSize = (svg) => {
                 const size = getSvgExSize(svg);
@@ -1180,7 +1228,7 @@ async function main() {
             if (!wrapped.lines) {
                 const png = rasterize(wrapped.single, wrapped.size);
                 log(`渲染：${png.width}×${png.height}  latex="${latex.slice(0, 30)}" (${clientIp})`);
-                return res.status(200).json({
+                return res.status(200).json(renderCachePut(cacheKey, {
                     data: png.data,
                     width: png.width,
                     height: png.height,
@@ -1188,7 +1236,7 @@ async function main() {
                     naturalHeight,
                     renderer: RENDERER_VERSION,
                     ...cjkFields
-                });
+                }));
             }
 
             const lines = wrapped.lines.map((line) => {
@@ -1204,7 +1252,7 @@ async function main() {
             const width = lines.reduce((max, line) => Math.max(max, line.width), 0);
             const height = lines.reduce((sum, line) => sum + line.height, 0) + (lines.length - 1) * LINE_GAP;
             log(`换行渲染：${lines.length} 行 ${width}×${height}  latex="${latex.slice(0, 30)}" (${clientIp})`);
-            return res.status(200).json({
+            return res.status(200).json(renderCachePut(cacheKey, {
                 // data 保留首行，旧版客户端至少能显示一行
                 data: lines[0].data,
                 width,
@@ -1215,7 +1263,7 @@ async function main() {
                 naturalHeight,
                 renderer: RENDERER_VERSION,
                 ...cjkFields
-            });
+            }));
         } catch (error) {
             console.error(`渲染失败 (${clientIp})：`, error.message);
             res.status(500).json({ error: '渲染失败', details: error.message });
