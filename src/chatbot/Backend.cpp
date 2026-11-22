@@ -1474,6 +1474,10 @@ void ChatBot::pruneSessionAttachments(const QString& sessionId) {
 }
 
 void ChatBot::warmAttachmentCache(const SessionData& session) {
+    // 构造函数在 BeforeMain 里跑，此时还没有 QCoreApplication：QThreadPool::globalInstance()
+    // 依赖 application 实例，提前 start() 会直接空指针崩溃（实测 0x00000010 段错误，
+    // 且发生在启动期，会被启动器判为试用失败并回滚）。预热只是优化，跳过即可。
+    if (QCoreApplication::instance() == nullptr) return;
     QVector<MessagePart> imageParts;
     for (const auto& msg : session.messages) {
         for (const auto& part : msg.parts) {
