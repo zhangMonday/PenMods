@@ -220,6 +220,17 @@ void Mod::setPendingVoiceChatText(const QString& text) {
     emit pendingVoiceChatTextChanged();
 }
 
+// 词典页"追问AI"：跳转时只把上下文放在内存里（JSON: source/translation/ai/ts）。
+// 不创建会话、不写盘——用户没有真正发送就离开时，这份上下文随页面一起丢弃；
+// 真正落库的时机在 ChatAssistant.qml 的首轮发送里，和用户那句追问同一条消息。
+QString Mod::getPendingAiFollowupContext() const { return mPendingAiFollowupContext; }
+
+void Mod::setPendingAiFollowupContext(const QString& context) {
+    if (mPendingAiFollowupContext == context) return;
+    mPendingAiFollowupContext = context;
+    emit pendingAiFollowupContextChanged();
+}
+
 void Mod::onUiCompleted() const {
 
     // AutoFix vendor_storage.
@@ -281,7 +292,6 @@ PEN_HOOK(bool, license_verify) { return true; }
 #include "filemanager/viewer/ImageViewer.h"
 
 #include "helper/AntiEmbs.h"
-#include "helper/Contributors.h"
 #include "helper/DeveloperSettings.h"
 #include "helper/FontCache.h"
 #include "helper/NetworkSettings.h"
@@ -383,7 +393,6 @@ __attribute__((constructor)) static void BeforeMain() {
     INSTANCE(BluetoothStorage);
     INSTANCE(BluetoothBattery);
     INSTANCE(CaCertificates);
-    INSTANCE(Contributors);
     INSTANCE(DeveloperSettings);
     INSTANCE(FontCache);
     INSTANCE(NetworkSettings);
