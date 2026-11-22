@@ -530,14 +530,6 @@ bool MusicPlayer::isHostPlaying() const {
     return state == PlayState::PLAYING;
 }
 
-/// 当前曲目的本地绝对路径（不是给宿主的临时 `.mp3` 软链接）。
-/// 需求 11「音频转文字」需要一个真实可读的文件；暂停中、已结束都照旧返回，只有根本没有
-/// 播放目标时才返回空串 —— 转写要的是"这一首"，不是"这一秒在不在响"。
-QString MusicPlayer::currentAudioLocalPath() const {
-    if (!mCurrentPlaying.mFile) return {};
-    return mCurrentPlaying.mFile->absoluteFilePath();
-}
-
 bool MusicPlayer::shouldPreventNativeScanSuspend(void* soundCenter) const {
     return mIsTakeOver && !mPauseOnScan && isHostPlaying() && hostOwnsDecoder(soundCenter);
 }

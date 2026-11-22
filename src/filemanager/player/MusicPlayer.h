@@ -117,10 +117,6 @@ public:
     /// 供 QML 调用：终止当前音乐并释放播放器状态
     Q_INVOKABLE void stop();
 
-    /// 供 QML 调用：当前曲目的本地绝对路径（无播放目标时为空串）。
-    /// 需求 11 的「音频转文字」用它取源文件。
-    Q_INVOKABLE QString currentAudioLocalPath() const;
-
     /// 供 QML 调用：释放当前 MUSIC 引用（播放停止/关闭播放器时）
     Q_INVOKABLE void releaseAudio();
 

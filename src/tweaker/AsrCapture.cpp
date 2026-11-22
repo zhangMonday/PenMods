@@ -40,13 +40,6 @@ void runCommand(const char* command) {
     }
 }
 
-/// 静音判定：int16 满量程 32767，这里取 300 左右的峰值当作"没人说话"。
-/// 设备麦克风增益未知，所以阈值保守 + 需要的静音时间长（2 秒）—— 判早了会截断用户的话，
-/// 判晚了只是多等一会儿，两种错误的代价不对称。
-constexpr int kSilencePeak       = 300;
-constexpr int kSilenceAfterMs    = 2000;
-constexpr int kSilenceMinTotalMs = 1200;
-
 /// 设备/格式探测的缓存。
 /// `QAudioDeviceInfo::defaultInputDevice()` 会枚举 ALSA 设备，`isFormatSupported()` 会真的打开
 /// PCM 设备做一次格式协商 —— 两步加起来在设备上是几百毫秒。以前每次按语音键都要付一遍，
@@ -147,11 +140,7 @@ bool AsrCapture::start(QString& reason) {
     mSampleRate = format.sampleRate();
     mChannels   = qMax(1, format.channelCount());
     mPcm.clear();
-    mLimitReached   = false;
-    mSilenceEmitted = false;
-    mHeardSpeech    = false;
-    mSilentMs       = 0;
-    mTotalMs        = 0;
+    mLimitReached = false;
     mError.clear();
 
     // 麦克风竞争：厂商唯一已知可行的顺序（forceStop → amixer on → AudioDaemon 引用）
@@ -192,9 +181,7 @@ bool AsrCapture::start(QString& reason) {
             _applyLimit();
             return;
         }
-        const QByteArray kept = chunk.left(room);
-        mPcm.append(kept);
-        _analyseSilence(kept);
+        mPcm.append(chunk.left(room));
         if (mPcm.size() >= mMaxBytes) _applyLimit();
     });
 
@@ -249,43 +236,6 @@ void AsrCapture::_release() {
     if (mDaemonHeld) {
         AudioDaemon::getInstance().release(AudioSource::SYSTEM);
         mDaemonHeld = false;
-    }
-}
-
-void AsrCapture::setSilenceAutoStop(bool enabled) {
-    mSilenceEnabled = enabled;
-    mSilenceEmitted = false;
-    mHeardSpeech    = false;
-    mSilentMs       = 0;
-}
-
-void AsrCapture::_analyseSilence(const QByteArray& chunk) {
-    if (!mSilenceEnabled || mSilenceEmitted || chunk.isEmpty()) return;
-    const qint64 bytesPerMs = static_cast<qint64>(mSampleRate) * mChannels * 2 / 1000;
-    if (bytesPerMs <= 0) return;
-
-    const auto* data  = reinterpret_cast<const uchar*>(chunk.constData());
-    const int   count = static_cast<int>(chunk.size() / 2);
-    int         peak  = 0;
-    for (int i = 0; i < count; ++i) {
-        // 按字节拼出 int16（小端），避免依赖 QByteArray 的对齐
-        const auto sample    = static_cast<qint16>(static_cast<quint16>(data[i * 2] | (data[i * 2 + 1] << 8)));
-        const int  magnitude = sample < 0 ? -static_cast<int>(sample) : static_cast<int>(sample);
-        if (magnitude > peak) peak = magnitude;
-    }
-
-    const int chunkMs  = static_cast<int>(chunk.size() / bytesPerMs);
-    mTotalMs          += chunkMs;
-    if (peak >= kSilencePeak) {
-        mHeardSpeech = true;
-        mSilentMs    = 0;
-        return;
-    }
-    if (!mHeardSpeech) return; // 还没听到人声，不做静音收尾（避免一开始就误判）
-    mSilentMs += chunkMs;
-    if (mTotalMs >= kSilenceMinTotalMs && mSilentMs >= kSilenceAfterMs) {
-        mSilenceEmitted = true;
-        emit silenceDetected();
     }
 }
 

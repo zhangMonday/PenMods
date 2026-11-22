@@ -14,8 +14,6 @@
 #include "system/input/InputDaemon.h"
 #include "system/sound/AudioDaemon.h"
 
-#include "tweaker/AsrService.h"
-
 #include "Version.h"
 
 #include <QAudio>
@@ -246,18 +244,6 @@ PEN_HOOK(uint32, _ZN12YSoundCenter9playMusicERK7QStringxd, void* self, void* a2,
 #endif
 
 PEN_HOOK(uint64, _ZN13YRecordCenter8startAsrEv, uint64 self, void* a2, void* a3, void* a4, void* a5) {
-    // 需求 10：DeepSeek 语音识别接管（默认关闭）。
-    // 复用这个已有的 hook 而不是再挂一个：同一个地址被 DobbyHook 两次会互相踩踏，
-    // 万一我们的 detour 把这条保护顶掉，录音期间厂商录音就挡不住了。
-    // 关闭时 onRecordCenterStartAsr() 立刻返回 false，下面的原逻辑一行都不变。
-    try {
-        if (mod::AsrService::getInstance().onRecordCenterStartAsr(reinterpret_cast<void*>(self))) {
-            // 已接管：自己录音，返回一个自增的"录音序号"，语义与本 hook 下面挡住厂商录音时一致
-            return ++*((uint64*)self + 14);
-        }
-    } catch (...) {
-        // 接管逻辑抛异常时继续走原路径，绝不能让语音入口消失
-    }
     if (mod::AudioRecorder::getInstance().isWorking()) {
         return ++*((uint64*)self + 14);
     }

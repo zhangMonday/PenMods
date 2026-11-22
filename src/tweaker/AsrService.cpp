@@ -6,10 +6,6 @@
 
 #include "tweaker/AsrService.h"
 
-// YEnum/YPointer 现在只剩符号名注释用途（语音助手页的页面驱动代码已经删掉），保留 include 无副作用。
-#include "base/YEnum.h"
-#include "base/YPointer.h"
-
 #include "common/Event.h"
 #include "common/Utils.h"
 
@@ -25,19 +21,15 @@ namespace mod {
 
 namespace {
 
-// 厂商符号 —— 全部来自 `KeyBoard.cpp` / `AudioRecorder.cpp` 里已经在用的那几个。
-constexpr auto kSetAsrResult   = "_ZN14YSpeechManager12setAsrResultERK7QString";
-constexpr auto kStartAsrRecord = "_ZN14YSpeechManager14startAsrRecordEv";
-constexpr auto kStopAsrRecord  = "_ZN14YSpeechManager13stopAsrRecordEv";
+// 厂商符号 —— 全部来自 `KeyBoard.cpp` 里已经在用的那几个。
+constexpr auto kSetAsrResult  = "_ZN14YSpeechManager12setAsrResultERK7QString";
+constexpr auto kStopAsrRecord = "_ZN14YSpeechManager13stopAsrRecordEv";
 
 /// 注入文本之后，厂商 `recognizing` 状态如果还没回到 idle，等这么久再兜底收尾。
 /// 为什么要兜底：接管期间厂商从来没有真正开始录音，它的状态机完全没前进过；如果哪个版本里
 /// `setAsrResult` 自己也不推进状态，键盘麦克风图标和语音页的"正在聆听"就会一直亮着。
 /// 兜底只做"能确认还卡着"时才动手（读不到状态就什么都不做，避免误调厂商 stop 把正常流程打断）。
 constexpr int kStateRecoveryDelayMs = 1200;
-
-/// 语音助手页的页索引变化：打开该页本身也会改变页索引，所以给会话开始后的头 1 秒一个宽限期。
-constexpr int kPageChangeGraceMs = 1000;
 
 constexpr int kDefaultTimeoutMs   = 20000;
 constexpr int kDefaultMaxRecordMs = 45000;
@@ -47,18 +39,6 @@ constexpr int kDefaultMaxRecordMs = 45000;
 /// 画出来，再干活；录音本身是"听到人声才开始计"的，晚 30 ms 不会丢内容。
 constexpr int kCaptureStartDelayMs = 30;
 
-/// 一个 hook 的目标地址与原始函数指针（`origin` 由 Dobby 填）。
-struct VoiceHook {
-    const char* symbol;
-    void*       target{nullptr};
-    void*       origin{nullptr};
-    bool        active{false};
-};
-
-// 只包含 POD（指针/布尔），常量初始化，可以安全地在 BeforeMain 之前存在。
-VoiceHook g_startAsrRecordHook{kStartAsrRecord};
-VoiceHook g_stopAsrRecordHook{kStopAsrRecord};
-
 } // namespace
 
 AsrService::AsrService() : Logger("AsrService") {
@@ -66,7 +46,6 @@ AsrService::AsrService() : Logger("AsrService") {
 
     mCapture     = new AsrCapture(this);
     mVoiceClient = new DeepSeekAsr(this);
-    mFileClient  = new DeepSeekAsr(this);
 
     mSessionDeadline.setSingleShot(true);
     connect(&mSessionDeadline, &QTimer::timeout, this, [this]() {
@@ -82,27 +61,14 @@ AsrService::AsrService() : Logger("AsrService") {
         _finishSession();
     });
 
-    // 语音助手页没有我们能挂钩的停止按钮：靠"听到人声之后安静 2 秒"收尾
-    connect(mCapture, &AsrCapture::silenceDetected, this, [this]() {
-        if (mVoiceState != VoiceState::Listening || !mSessionVendorOwned) return;
-        info("检测到静音，结束语音助手会话");
-        _finishSession();
-    });
-
     connect(mVoiceClient, &DeepSeekAsr::succeeded, this, [this](const QString& text, int durationMs) {
         QObject* manager = mPendingManager.data();
         mPendingManager.clear();
         info("DeepSeek 语音识别成功：{} 字 / {} ms", text.size(), durationMs);
-        // 语音助手页 / 长按路径：结果只用气泡交出去。这一条路径不再打开任何页面、也不再驱动
-        // 厂商状态机，所以没有"注入点"；把文本原样弹给用户（这正是用户要的"松手气泡出结果"）。
-        if (mSessionVendorOwned || !manager) {
-            if (!mSessionVendorOwned) warn("识别成功但注入目标已失效，只弹气泡");
+        if (!manager) {
+            warn("识别成功但注入目标已失效，结果没地方放");
             _setVoiceState(VoiceState::Idle, QStringLiteral("识别完成"));
-            // 气泡里放识别文本（过长就截断，320x170 的屏幕放不下一整段话）。
-            QString bubble = text.trimmed();
-            if (bubble.isEmpty()) bubble = QStringLiteral("没有识别到文字");
-            else if (bubble.size() > 100) bubble = bubble.left(100) + QStringLiteral("…");
-            _toast(bubble);
+            _toast(QStringLiteral("识别完成，但输入框已经关闭"));
             return;
         }
         // 先注入再复位状态：QML 的 acceptVoiceResult() 要求"语音输入仍在进行"才收下文本。
@@ -118,14 +84,6 @@ AsrService::AsrService() : Logger("AsrService") {
         _toast(QStringLiteral("DeepSeek 语音识别失败：") + reason);
     });
 
-    // 换页 = 用户离开了语音助手页（那一页没有我们能碰的"停止录音"接口）
-    connect(&Event::getInstance(), &Event::currentPageIndexChanged, this, [this](int) {
-        if (mVoiceState != VoiceState::Listening || !mSessionVendorOwned) return;
-        if (mSessionClock.elapsed() < kPageChangeGraceMs) return;
-        info("页面已切换，结束语音助手会话");
-        _finishSession();
-    });
-
     connect(&Event::getInstance(), &Event::beforeUiInitialization, this, [this](QQuickView&, QQmlContext* context) {
         mRootContext = context;
         context->setContextProperty("asrService", this);
@@ -134,8 +92,7 @@ AsrService::AsrService() : Logger("AsrService") {
         if (mEnabled) QTimer::singleShot(1500, this, []() { AsrCapture::warmUp(); });
     });
 
-    // 只在开启时装 hook：默认关闭时 DobbyHook 一次都不会被调用，行为与没有这个功能完全一致。
-    if (mEnabled) _installHooks();
+    // 长按语音 / 语音助手页完全交还原厂：这里不安装任何 hook，也不拦 showSpeechPage。
 }
 
 // ───────────────────────── 配置 ─────────────────────────
@@ -184,12 +141,10 @@ void AsrService::setEnabled(bool value) {
     _saveSection();
 
     if (mEnabled) {
-        _installHooks();
         // 刚打开：UI 已经起来的话立刻预热（没起来的路径由构造函数里的延迟预热兜住）。
         if (mRootContext) QTimer::singleShot(0, this, []() { AsrCapture::warmUp(); });
-    } else {
-        if (mVoiceState != VoiceState::Idle) _abortSession(QStringLiteral("已关闭 DeepSeek 语音识别"));
-        _removeHooks();
+    } else if (mVoiceState != VoiceState::Idle) {
+        _abortSession(QStringLiteral("已关闭 DeepSeek 语音识别"));
     }
     info("DeepSeek 语音识别接管：{}", value ? "开启" : "关闭");
     emit settingsChanged();
@@ -311,19 +266,12 @@ bool AsrService::_mayTakeOver(QString& reason) const {
 
 QObject* AsrService::_contextSpeechManager() const {
     if (!mRootContext) return nullptr;
-    // 宿主把 YSpeechManager 作为 `speechManager` 注入根上下文；YRecordCenter 那条入口拿不到它，
-    // 只能从这里取，否则识别结果没有地方注入。
+    // 宿主把 YSpeechManager 作为 `speechManager` 注入根上下文。键盘语音键的调用方正常都会把它
+    // 传进来，这条路径只是兜底：拿不到管理器时至少还有一根可注入的引用可用。
     return mRootContext->contextProperty(QStringLiteral("speechManager")).value<QObject*>();
 }
 
-bool AsrService::_speechAssistantEnabled() const {
-    const auto ai = Config::getInstance().read("ai");
-    if (!ai.is_object()) return false;
-    const auto it = ai.find("speech_assistant");
-    return it != ai.end() && it->is_boolean() && it->get<bool>();
-}
-
-bool AsrService::_startSession(QObject* speechManager, bool vendorOwned, QString& reason) {
+bool AsrService::_startSession(QObject* speechManager, QString& reason) {
     if (!_mayTakeOver(reason)) return false;
 
     QObject* manager = speechManager ? speechManager : _contextSpeechManager();
@@ -334,25 +282,15 @@ bool AsrService::_startSession(QObject* speechManager, bool vendorOwned, QString
 
     // 状态先发出去、麦克风下一拍再开（原因见 kCaptureStartDelayMs）：QML 立刻把语音图标
     // 切成"聆听中"，按键反馈不再被 ALSA 初始化卡住。
-    mSessionManager     = manager;
-    mSessionVendorOwned = vendorOwned;
+    mSessionManager = manager;
     mPendingManager.clear();
-    mCapture->setSilenceAutoStop(vendorOwned);
-    mSessionClock.start();
     mSessionDeadline.start(mMaxRecordMs);
     mCaptureStarting = true;
     const int startSeq = ++mCaptureStartSeq;
     _setVoiceState(VoiceState::Listening, QStringLiteral("正在聆听…"));
     QTimer::singleShot(kCaptureStartDelayMs, this, [this, startSeq]() { _openCapture(startSeq); });
 
-    // 语音助手页 / 长按语音：**不再接管那一页**（真机上表现为长按约 20 秒才进页面、松手还没有文字）。
-    // 现在整条链路只做两件事：自己采集 + 用气泡反馈，绝不打开任何页面、也不推厂商的 recognizing
-    // 状态机 —— 那一页打不开的根因正是"我们把它的状态推到 ASRBegin，它就拒绝显示"。
-    // 结果直接弹气泡（成功给文本、失败给原因），松手即出，不再有页面跳转的性能问题。
-    if (vendorOwned)
-        _toast(QStringLiteral("正在聆听…松开结束"));
-
-    info("DeepSeek 语音接管开始（{}，上限 {} ms）", vendorOwned ? "语音助手页/长按" : "键盘语音键", mMaxRecordMs);
+    info("DeepSeek 语音接管开始（键盘语音键，上限 {} ms）", mMaxRecordMs);
     return true;
 }
 
@@ -371,27 +309,15 @@ void AsrService::_openCapture(int startSeq) {
         _toast(captureError);
         mSessionManager.clear();
         mSessionDeadline.stop();
-        mCapture->setSilenceAutoStop(false);
         _setVoiceState(VoiceState::Idle, captureError);
         return;
     }
-    // 语音助手页 / 长按：不再推厂商的 recognizing。那一页显示不出来的根因就是我们把它推到了
-    // ASRBegin（页面等待 idle 才允许显示），上一轮"长按 20 秒才进页面"就是这么来的。
-}
-
-bool AsrService::shouldSuppressVendorSpeechPage() const {
-    return mEnabled && mSessionVendorOwned && mVoiceState != VoiceState::Idle;
-}
-
-void AsrService::markVendorSpeechPageVisible() {
-    // 兼容旧资源库：YSpeechPage.qml 在 onVisibleChanged 里仍会调这个方法。
-    // 现在接管不再打开、也不再驱动原厂语音助手页，所以这里只留一个空实现。
 }
 
 bool AsrService::beginVoiceCapture(QObject* speechManager) {
     try {
         QString reason;
-        if (!_startSession(speechManager, false, reason)) {
+        if (!_startSession(speechManager, reason)) {
             if (!reason.isEmpty()) _toast(reason);
             return false;
         }
@@ -442,12 +368,10 @@ void AsrService::_finishSession() {
         info("语音接管：麦克风尚未打开就被取消");
         mSessionManager.clear();
         mSessionDeadline.stop();
-        mCapture->setSilenceAutoStop(false);
         _setVoiceState(VoiceState::Idle, QStringLiteral("已取消"));
         return;
     }
     mSessionDeadline.stop();
-    mCapture->setSilenceAutoStop(false);
 
     const int        rate   = mCapture->sampleRate();
     const QByteArray pcm    = mCapture->stop(); // 已取左声道、单声道
@@ -482,10 +406,9 @@ void AsrService::_abortSession(const QString& reason) {
         mCaptureStarting = false;
     }
     mSessionDeadline.stop();
-    mCapture->setSilenceAutoStop(false);
     mVoiceClient->cancel();
     mCapture->abort();
-    // 不再动厂商的 recognizing（新方案根本不推它），只清掉自己的会话目标。
+    // 接管从不推进厂商的 recognizing（我们从来没调用它的 startAsrRecord），只清自己的会话目标。
     mSessionManager.clear();
     mPendingManager.clear();
     _setVoiceState(VoiceState::Idle, reason);
@@ -579,8 +502,7 @@ void AsrService::_toast(const QString& text) {
     info("提示：{}", text.toStdString());
     // UI 还没起来（或已销毁）时不要往宿主里打：showToast 依赖 YGlobal 单例，早了会打空指针
     if (!mRootContext) return;
-    // 同一条提示 2 秒内只弹一次：一次语音操作可能连续经过 startAsrRecord / YRecordCenter::startAsr
-    // 两个入口，否则用户会看到两三条一模一样的气泡。
+    // 同一条提示 2 秒内只弹一次：键盘语音键的失败与回落可能在同一毫秒里各说一次。
     if (text == mLastToastText && mLastToastClock.isValid() && mLastToastClock.elapsed() < 2000) return;
     mLastToastText = text;
     mLastToastClock.start();
@@ -589,122 +511,6 @@ void AsrService::_toast(const QString& text) {
     } catch (...) {
         warn("气泡提示失败：{}", text.toStdString());
     }
-}
-
-// ───────────────────────── 接管：hook 安装 ─────────────────────────
-
-void AsrService::_installHooks() {
-    if (mHooksInstalled) return;
-
-    // detour 里再包一层 try/catch：任何异常都必须回到 origin(...)，不能把厂商的语音入口弄丢。
-    static auto startAsrRecordDetour = +[](void* self) {
-        bool handled = false;
-        try {
-            handled = AsrService::getInstance()._onVendorStartAsrRecord(self);
-        } catch (...) {
-            handled = false;
-        }
-        if (handled) return;
-        if (g_startAsrRecordHook.origin) reinterpret_cast<void (*)(void*)>(g_startAsrRecordHook.origin)(self);
-    };
-    static auto stopAsrRecordDetour = +[](void* self) {
-        bool handled = false;
-        try {
-            handled = AsrService::getInstance()._onVendorStopAsrRecord(self);
-        } catch (...) {
-            handled = false;
-        }
-        if (handled) return;
-        if (g_stopAsrRecordHook.origin) reinterpret_cast<void (*)(void*)>(g_stopAsrRecordHook.origin)(self);
-    };
-    const auto install = [](VoiceHook& hook, dobby_dummy_func_t detour) {
-        if (hook.active) return true;
-        hook.target = PEN_SYM(hook.symbol);
-        if (!hook.target) {
-            spdlog::warn("找不到厂商符号 {}，跳过语音接管", hook.symbol);
-            return false;
-        }
-        if (DobbyHook(hook.target, detour, (dobby_dummy_func_t*)&hook.origin) != 0) {
-            spdlog::warn("语音接管 hook 安装失败：{}", hook.symbol);
-            hook.target = nullptr;
-            return false;
-        }
-        hook.active = true;
-        return true;
-    };
-
-    // 与 base/Hook.h 一致：函数指针到 dobby_dummy_func_t 用 C 风格转换（GCC/aarch64 支持）
-    install(g_startAsrRecordHook, (dobby_dummy_func_t)startAsrRecordDetour);
-    install(g_stopAsrRecordHook, (dobby_dummy_func_t)stopAsrRecordDetour);
-
-    mHooksInstalled = g_startAsrRecordHook.active || g_stopAsrRecordHook.active;
-    if (mHooksInstalled) info("DeepSeek 语音接管已安装 hook");
-}
-
-void AsrService::_removeHooks() {
-    const auto remove = [](VoiceHook& hook) {
-        if (!hook.active || !hook.target) return;
-        if (DobbyDestroy(hook.target) != 0) {
-            // 还原失败时行为仍然正确：detour 留在原地，但 _onVendor* 在关闭后一律返回 false，
-            // 等于原样透传给 origin(...)。
-            spdlog::warn("语音接管 hook 还原失败：{}", hook.symbol);
-        }
-        hook.active = false;
-    };
-    remove(g_startAsrRecordHook);
-    remove(g_stopAsrRecordHook);
-    mHooksInstalled = false;
-    info("DeepSeek 语音接管已移除 hook");
-}
-
-bool AsrService::_onVendorStartAsrRecord(void* manager) {
-    if (!mEnabled) return false;
-    // 这条入口只有厂商自己会走（键盘语音键在 KeyBoard 里就分流出去了），也就是语音助手页 /
-    // 长按语音。它的识别结果只有"语音助手"开启才会流向聊天页；关闭时那一页靠原厂的语义指令
-    // 解析（speechManager.content）工作，我们无法复现，所以那种情况下原样交给厂商。
-    //
-    // 注意：接管的是**采集**，不是那一页。语音助手页本身已经放弃接管（改为气泡反馈），
-    // 所以这里不再补开页面、也不再推厂商的 recognizing（见 _startSession 的注释）。
-    // 任何前置条件不满足（开关/Key/主线程/麦克风）都会返回 false → origin(...) 照跑，原厂行为不变。
-    if (!_speechAssistantEnabled()) return false;
-    if (mVoiceState != VoiceState::Idle) {
-        // 已经有一次会话在跑：把这次的启动吞掉，避免第二路麦克风采集
-        debug("已有语音会话，忽略重复的 startAsrRecord");
-        return true;
-    }
-    QString reason;
-    if (!_startSession(reinterpret_cast<QObject*>(manager), true, reason)) {
-        if (!reason.isEmpty()) _toast(reason);
-        return false; // 回落厂商路径
-    }
-    return true;
-}
-
-bool AsrService::_onVendorStopAsrRecord(void* manager) {
-    if (mVoiceState == VoiceState::Idle) return false;
-    if (manager && mSessionManager && mSessionManager.data() != reinterpret_cast<QObject*>(manager)) return false;
-    if (mVoiceState == VoiceState::Recognizing) {
-        // 已经在等结果，多余的 stop 直接吃掉（再走厂商 stop 会把状态机提前推回 idle）
-        return true;
-    }
-    _finishSession();
-    return true;
-}
-
-bool AsrService::onRecordCenterStartAsr(void* recordCenter) {
-    if (!mEnabled) return false;
-    // 同 _onVendorStartAsrRecord：只接管"文本会被送到聊天页"的语音助手场景。
-    if (!_speechAssistantEnabled()) return false;
-    if (mVoiceState != VoiceState::Idle) {
-        debug("已有语音会话，忽略重复的 YRecordCenter::startAsr");
-        return true;
-    }
-    QString reason;
-    if (!_startSession(_contextSpeechManager(), true, reason)) {
-        if (!reason.isEmpty()) _toast(reason);
-        return false;
-    }
-    return true;
 }
 
 } // namespace mod

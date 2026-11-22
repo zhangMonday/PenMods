@@ -14,38 +14,36 @@
 #include <QObject>
 #include <QPointer>
 #include <QString>
-#include <QStringList>
 #include <QTimer>
-#include <QVector>
 
 class QQmlContext;
-class QProcess;
 
 namespace mod {
 
 class AsrCapture;
 class DeepSeekAsr;
 
-/// 需求 10（DeepSeek 语音识别接管）+ 需求 11（音频转文字）。
+/// 需求 10（DeepSeek 语音识别接管）。
+///
+/// 接管范围 —— 只有键盘上的语音按钮，这是真机与用户共同确认的唯一范围：
+///   • 键盘语音键（`mod::KeyBoard::startVoiceInput` / `stopVoiceInput` 分流）：自己采集 →
+///     上传 DeepSeek → 通过 `YSpeechManager::setAsrResult` 注入文本，输入页照旧收下。
+///   • 长按语音 / 语音助手页：**完全交还原厂**。这条链路一行都没被动过 —— 不 hook
+///     `YRecordCenter::startAsr`、不 hook `YSpeechManager::startAsrRecord` / `stopAsrRecord`、
+///     不拦 `YGlobal::showSpeechPage`、不弹气泡、不打开任何页面。原厂的识别、页面跳转、
+///     语音助手文案全部由厂商自己负责。
+///   • 跟读评分（`startFollowSpeech`）同样完全不动。
 ///
 /// 设计约束（都是硬性的）：
-///   • **默认关闭**。关闭时不安装任何 hook、不碰麦克风、不建网络管理器 —— 行为与没有这个类时
-///     完全一致；`ai.asr.enabled` 是唯一的开关。
-///   • 打开后只做"启动/结果级"接管：厂商的语音识别协议是未知的，我们不解析它的音频，也不重写
-///     它的状态机，只在自己录音 → DeepSeek 识别 → 通过 `YSpeechManager::setAsrResult` 注入文本。
+///   • **默认关闭**。关闭时不碰麦克风、不建网络管理器 —— 行为与没有这个类时完全一致；
+///     `ai.asr.enabled` 是唯一的开关。
+///   • 只做"启动/结果级"接管：厂商的语音识别协议是未知的，我们不解析它的音频，也不重写
+///     它的状态机，只在自己录音 → DeepSeek 识别 → 注入文本。
 ///   • 任何一步失败都必须能回到用户熟悉的行为。启动阶段（还没开始录音）失败 → 直接调用
-///     `origin(...)` 让厂商自己识别；录制之后失败（超时/HTTP/解析/空音频）没法重放用户的这句话，
-///     所以只弹一次气泡说明原因并复位 UI，让用户重来 —— 绝不把界面留在"聆听中"。
+///     `origin(...)` 让厂商自己识别；录制之后失败（超时/HTTP/解析/空音频）没法重放用户的
+///     这句话，所以只弹一次气泡说明原因并复位 UI，让用户重来 —— 绝不把界面留在"聆听中"。
 ///   • 网络全程异步（QNetworkAccessManager + 超时定时器），UI 线程不和网络同步。
 ///   • 日志不写音频、不写 API Key。
-///
-/// 接管范围：
-///   • 键盘语音键（KeyBoard 直接分流）：照旧注入 `YSpeechManager::setAsrResult`，输入页收文本。
-///   • "语音助手"开启时的语音助手页 / 长按语音（YRecordCenter::startAsr 与 YSpeechManager::startAsrRecord
-///     两条入口）：**已放弃接管那一页**（真机长按约 20 秒才进页面、松手无文字）。现在只自己采集 +
-///     气泡反馈——开始弹「正在聆听…松开结束」，松手立即上传，成功弹识别文本、失败弹原因；
-///     全过程不打开任何页面，也不推厂商的 `recognizing`（那一页打不开正是被我们推到 ASRBegin 挡住）。
-///     跟读评分（startFollowSpeech）完全不动。
 class AsrService : public QObject, public Singleton<AsrService>, private Logger {
     Q_OBJECT
 
@@ -57,19 +55,11 @@ class AsrService : public QObject, public Singleton<AsrService>, private Logger 
     Q_PROPERTY(QString apiKeyHint READ apiKeyHint NOTIFY settingsChanged)
     Q_PROPERTY(QString apiKeySource READ apiKeySource NOTIFY settingsChanged)
     Q_PROPERTY(int timeoutMs READ timeoutMs WRITE setTimeoutMs NOTIFY settingsChanged)
-    /// 我们自己的麦克风采集/识别是否在进行（键盘语音键、语音助手页的会话状态）。
-    /// QML 用它和厂商的 `speechManager.recognizing` 一起判断"是否正在聆听"，因为接管期间厂商的
-    /// 状态机根本不会前进（我们从来没有调用它的 startAsrRecord）。
+    /// 我们自己的麦克风采集/识别是否在进行（键盘语音键的会话状态）。
+    /// QML 用它和厂商的 `speechManager.recognizing` 一起判断"是否正在聆听"，因为接管期间
+    /// 厂商的状态机根本不会前进（我们从来没有调用它的 startAsrRecord）。
     Q_PROPERTY(bool voiceActive READ voiceActive NOTIFY voiceChanged)
     Q_PROPERTY(QString voiceStatus READ voiceStatus NOTIFY voiceChanged)
-
-    // ───────────── 需求 11：音频转文字 ─────────────
-    Q_PROPERTY(bool transcribeBusy READ transcribeBusy NOTIFY transcribeChanged)
-    Q_PROPERTY(QString transcribeStatus READ transcribeStatus NOTIFY transcribeChanged)
-    Q_PROPERTY(QString transcribeProgress READ transcribeProgress NOTIFY transcribeChanged)
-    Q_PROPERTY(QString transcribePreview READ transcribePreview NOTIFY transcribeChanged)
-    Q_PROPERTY(bool transcribeReady READ transcribeReady NOTIFY transcribeChanged)
-    Q_PROPERTY(QString transcribeSource READ transcribeSource NOTIFY transcribeChanged)
 
 public:
     // ───────────── 需求 10：设置页 ─────────────
@@ -92,45 +82,12 @@ public:
     /// 返回 true 表示 AsrService 已经接管这次语音输入，调用方不要再进厂商路径。
     bool beginVoiceCapture(QObject* speechManager);
     bool endVoiceCapture(QObject* speechManager);
-    /// 放弃当前会话（离开输入页/语音页时用）：不录音、不上传、直接把麦克风还给系统。
+    /// 放弃当前会话（离开输入页时用）：不录音、不上传、直接把麦克风还给系统。
     Q_INVOKABLE void cancelVoiceCapture();
-    /// 兼容旧资源库：YSpeechPage.qml 的 onVisibleChanged 仍会调用它。
-    /// 现在语音助手页的接管已经整体放弃（改为气泡反馈），所以这里不做事。
-    Q_INVOKABLE void markVendorSpeechPageVisible();
-
-    /// 语音助手页 / 长按的会话进行中：不要让原厂打开语音助手页（见 KeyBoard.cpp 里的
-    /// showSpeechPage hook）。那一页是跟着原厂录音状态机走的，我们只接管采集不接管页面，
-    /// 页面一旦出现就会一直停在"聆听中"，所以整段会话期间把打开动作拦掉，结束后原厂照旧。
-    [[nodiscard]] bool shouldSuppressVendorSpeechPage() const;
-
-    /// 语音助手页 / 长按语音的接管入口。
-    ///
-    /// 由 `src/recorder/AudioRecorder.cpp` 里**已经存在**的 `YRecordCenter::startAsr` PEN_HOOK 调用
-    /// （那个地址不能再被 DobbyHook 第二次，否则会把录音期间"挡住厂商录音"的保护顶掉）。
-    /// 返回 true = 已接管，调用方应直接返回一个自增的录音序号，不要再进厂商录音路径。
-    bool onRecordCenterStartAsr(void* recordCenter);
-
-    // ───────────── 需求 11：音频转文字 ─────────────
-    [[nodiscard]] bool    transcribeBusy() const { return mTranscribeBusy; }
-    [[nodiscard]] QString transcribeStatus() const { return mTranscribeStatus; }
-    [[nodiscard]] QString transcribeProgress() const { return mTranscribeProgress; }
-    [[nodiscard]] QString transcribePreview() const { return mTranscribePreview; }
-    [[nodiscard]] bool    transcribeReady() const { return !mTranscribePreview.isEmpty(); }
-    [[nodiscard]] QString transcribeSource() const { return mTranscribeSource; }
-
-    /// 不可用时返回一句可以直接弹气泡的原因；可用返回空串。
-    Q_INVOKABLE QString transcribeUnavailableReason() const;
-    Q_INVOKABLE void    startTranscribe(const QString& path);
-    /// 当前预览结果是否属于这首音频（按绝对路径比较，避免把 A 的文本保存到 B 上）。
-    Q_INVOKABLE bool transcribeResultFor(const QString& path) const;
-    Q_INVOKABLE void cancelTranscribe();
-    /// 保存为音频同目录同名 `.txt`（不覆盖已有文件，QSaveFile 原子写）。
-    Q_INVOKABLE bool saveTranscript();
 
 signals:
     void settingsChanged();
     void voiceChanged();
-    void transcribeChanged();
 
 private:
     friend Singleton<AsrService>;
@@ -153,105 +110,45 @@ private:
 
     // ── 接管（需求 10） ──
     bool     _mayTakeOver(QString& reason) const;
-    bool     _startSession(QObject* speechManager, bool vendorOwned, QString& reason);
+    bool     _startSession(QObject* speechManager, QString& reason);
     /// 真正打开麦克风（由 _startSession 推迟一拍调用，见那里的注释）。
     void     _openCapture(int startSeq);
     void     _finishSession();
     void     _abortSession(const QString& reason);
     void     _setVoiceState(VoiceState state, const QString& status);
     QObject* _contextSpeechManager() const;
-    /// 语音助手（`ai.speech_assistant`）是否开启。语音助手页的文本只有在这个开关打开时才会被
-    /// 送到聊天页；关闭时那一页走的是原厂语音指令解析，我们复现不了，所以那种情况下不接管。
-    bool _speechAssistantEnabled() const;
-    void _injectResult(QObject* manager, const QString& text);
-    void _scheduleStateRecovery(QObject* manager);
-    int  _readRecognizing(void* manager);
-    bool _pushRecognizing(void* manager, int state);
-    void _toast(const QString& text);
-    void _installHooks();
-    void _removeHooks();
-
-    // YSpeechManager 两个入口的接管回调（返回 true 表示已接管，不要调用 origin）。
-    // YRecordCenter::startAsr 走 AudioRecorder.cpp 里已有的 hook，见 onRecordCenterStartAsr()。
-    bool _onVendorStartAsrRecord(void* manager);
-    bool _onVendorStopAsrRecord(void* manager);
-
-    // ── 音频转文字（需求 11） ──
-    void                     _transcribeBegin(const QString& path);
-    /// 定位设备上的 mpv（转码器）。找不到返回空串，并把每一步的诊断（候选 + 存在与否、
-    /// 包装脚本解析/自检结果、PATH 查找结果）按顺序追加到 `tried`。结果在进程内缓存一次。
-    QString                  transcodeExecutable(QStringList& tried);
-    void                     _transcribeFail(const QString& reason);
-    void                     _transcribeCleanup();
-    void                     _transcribeDirect(const QString& path);
-    void                     _transcribeTranscode(const QString& path);
-    void                     _transcribeOnTranscodeFinished();
-    void                     _transcribePlanWav(const QString& wavPath);
-    void                     _transcribePlanRaw(const QString& pcmPath);
-    void                     _transcribePlanRange(qint64 dataOffset, qint64 dataBytes, int rate, int channels);
-    void                     _transcribeFinish();
-    void                     _transcribeRelease();
-    [[nodiscard]] QByteArray _segmentPayload() const;
-    void                     _uploadNextSegment();
-    void                     _segmentSucceeded(const QString& text);
-    void                     _segmentFailed(const QString& reason);
-    [[nodiscard]] bool       _transcribeTargetStillCurrent() const;
-    void                     _transcribeSetStatus(const QString& status, const QString& progress = QString());
+    void     _injectResult(QObject* manager, const QString& text);
+    void     _scheduleStateRecovery(QObject* manager);
+    int      _readRecognizing(void* manager);
+    bool     _pushRecognizing(void* manager, int state);
+    void     _toast(const QString& text);
 
     // ── 状态 ──
     json mCfg;
     bool mEnabled{false};
     int  mTimeoutMs{20000};
     int  mMaxRecordMs{45000};
-    bool mHooksInstalled{false};
 
     QPointer<QQmlContext> mRootContext;
     AsrCapture*           mCapture{nullptr};
     DeepSeekAsr*          mVoiceClient{nullptr};
-    DeepSeekAsr*          mFileClient{nullptr};
 
     // 语音会话
     QPointer<QObject> mSessionManager; ///< 本次会话要注入文本的 YSpeechManager
     QPointer<QObject> mPendingManager; ///< 已停止采集、等识别结果的注入目标
     QTimer            mSessionDeadline;
-    QElapsedTimer     mSessionClock;
     /// 麦克风正在异步打开（_startSession 发出的单拍延迟还没到）。这段时间里状态已经是
     /// Listening，但 mCapture 还没开始采，停止时必须先取消这次打开。
     bool mCaptureStarting{false};
     int  mCaptureStartSeq{0};
     VoiceState        mVoiceState{VoiceState::Idle};
-    bool              mSessionVendorOwned{false};
     bool              mRecognizingProbed{false};
     void*             mRecognizingGetter{nullptr};
     bool              mSetterProbed{false};
     void*             mRecognizingSetter{nullptr};
     QString           mVoiceStatus;
-    QString           mLastToastText; ///< 同一条气泡在短时间内只弹一次（多条入口可能连续失败）
+    QString           mLastToastText; ///< 同一条气泡在短时间内只弹一次
     QElapsedTimer     mLastToastClock;
-
-    // 音频转文字
-    QStringList        mSegmentTexts;   ///< 每段识别出来的文本（按顺序拼接）
-    QVector<qint64>    mSegmentOffsets; ///< 分段在 WAV 数据块里的偏移
-    QVector<qint64>    mSegmentBytes;   ///< 每段的 PCM 字节数（已对齐到采样帧）
-    QString            mSegmentSource;  ///< 分段的来源文件（转码产物或原 WAV）
-    QString            mSegmentSuffix{QStringLiteral("wav")};
-    bool               mSegmentDirectFile{false}; ///< true = 整文件直接当一段上传（Ogg）
-    int                mSegmentRate{16000};
-    int                mSegmentChannels{1};
-    QPointer<QProcess> mTranscode;
-    QString            mMpvExecutable; ///< 探测到的 mpv 路径（命中结果）
-    bool               mMpvProbed{false}; ///< 进程内只探测一次（命中/未命中都缓存）
-    QStringList        mMpvTried;      ///< 上次探测的完整诊断（失败信息复用，不重新探测）
-    QTimer             mTranscodeDeadline;
-    QString            mTranscodeTemp; ///< mpv 转码输出（临时文件）
-    QString            mTranscribeTarget;
-    QString            mTranscribeSource;
-    QString            mTranscribeStatus;
-    QString            mTranscribeProgress;
-    QString            mTranscribePreview;
-    int                mSegmentIndex{0};
-    int                mSegmentTotal{0};
-    bool               mTranscribeBusy{false};
 };
 
 } // namespace mod

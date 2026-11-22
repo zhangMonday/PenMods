@@ -36,11 +36,6 @@ public:
     /// 开启接管且 UI 已就绪时调一次，让第一次按语音键也不用等这一步。
     static void warmUp();
 
-    /// "静音自动收尾"：只在没有显式停止按钮的路径（语音助手页 / 长按语音）启用。
-    /// 录到过语音、且连续一段时间几乎没有能量时发一次 silenceDetected()，宿主据此结束这次采集。
-    /// 阈值取得很保守：宁可最后靠上限超时收尾，也不要在用户说话中途把音频截断。
-    void setSilenceAutoStop(bool enabled);
-
     /// 停止采集并返回单声道 16-bit PCM（长度对齐到采样帧；可能是空的）。
     QByteArray stop();
 
@@ -58,7 +53,6 @@ public:
 
 signals:
     void limitReached();
-    void silenceDetected();
 
 private:
     void _release();
@@ -75,14 +69,6 @@ private:
     bool       mLimitReached{false};
     bool       mDaemonHeld{false};
     bool       mMixerEnabled{false};
-
-    // 静音检测（只用于没有显式 stop 的路径）
-    bool mSilenceEnabled{false};
-    bool mHeardSpeech{false};
-    bool mSilenceEmitted{false};
-    int  mSilentMs{0};
-    int  mTotalMs{0};
-    void _analyseSilence(const QByteArray& chunk);
 };
 
 } // namespace mod

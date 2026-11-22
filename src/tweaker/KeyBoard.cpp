@@ -275,10 +275,10 @@ void KeyBoard::setScanBehavior(const QString& value) {
 }
 
 bool KeyBoard::startVoiceInput(QObject* speechManager) {
-    // 需求 10：DeepSeek 语音识别接管（默认关闭）。
-    // 关闭时 beginVoiceCapture() 立刻返回 false，这里不会安装任何 hook、也不会碰麦克风，
-    // 下面的原厂流程与以前一模一样；开启且条件满足时由 AsrService 自己录音并返回 true，
-    // 这时不调用厂商的 startAsrRecord —— 两路麦克风采集不能同时开。
+    // 需求 10：DeepSeek 语音识别接管（默认关闭，只接管这个键盘语音键）。
+    // 关闭时 beginVoiceCapture() 立刻返回 false，这里不会碰麦克风，下面的原厂流程与以前
+    // 一模一样；开启且条件满足时由 AsrService 自己录音并返回 true，这时不调用厂商的
+    // startAsrRecord —— 两路麦克风采集不能同时开。
     if (mod::AsrService::getInstance().beginVoiceCapture(speechManager)) return true;
 
     auto* startAsrRecord = PEN_SYM("_ZN14YSpeechManager14startAsrRecordEv");
@@ -296,6 +296,7 @@ bool KeyBoard::startVoiceInput(QObject* speechManager) {
 
 bool KeyBoard::stopVoiceInput(QObject* speechManager) {
     // 同上：接管中的停止由 AsrService 负责（停止采集 → 上传 → 注入文本 / 失败回退）。
+    // 长按语音那条路不经过这里，仍然完全由厂商处理。
     if (mod::AsrService::getInstance().endVoiceCapture(speechManager)) return true;
 
     auto* stopAsrRecord = PEN_SYM("_ZN14YSpeechManager13stopAsrRecordEv");
@@ -309,10 +310,6 @@ bool KeyBoard::stopVoiceInput(QObject* speechManager) {
 
 PEN_HOOK(uint64, _ZN7YGlobal14showSpeechPageEv, uint64 self) {
     if (mod::KeyBoard::getInstance().isStartingVoiceInput()) return 0;
-    // 语音助手页 / 长按的 DeepSeek 接管已经放弃页面（改为气泡反馈）：会话进行中不要再让原厂
-    // 打开那一页 —— 我们只接管采集，页面一旦出现就没有原厂录音在跑，会一直停在"聆听中"。
-    // 会话结束后（Idle）这个判断为 false，原厂链路完全照旧。
-    if (mod::AsrService::getInstance().shouldSuppressVendorSpeechPage()) return 0;
     return origin(self);
 }
 

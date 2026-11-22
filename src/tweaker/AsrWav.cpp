@@ -12,16 +12,6 @@ namespace mod::asr {
 
 namespace {
 
-constexpr int kChunkHeaderBytes = 8;
-
-quint16 readU16(const QByteArray& data, int offset) {
-    return qFromLittleEndian<quint16>(reinterpret_cast<const uchar*>(data.constData()) + offset);
-}
-
-quint32 readU32(const QByteArray& data, int offset) {
-    return qFromLittleEndian<quint32>(reinterpret_cast<const uchar*>(data.constData()) + offset);
-}
-
 void appendU16(QByteArray& out, quint16 value) {
     uchar buffer[2];
     qToLittleEndian<quint16>(value, buffer);
@@ -35,50 +25,6 @@ void appendU32(QByteArray& out, quint32 value) {
 }
 
 } // namespace
-
-bool parseWavHeader(const QByteArray& head, WavFormat& out) {
-    out = WavFormat{};
-    if (head.size() < 12) return false;
-    if (head.mid(0, 4) != QByteArrayLiteral("RIFF") || head.mid(8, 4) != QByteArrayLiteral("WAVE")) return false;
-
-    bool sawFormat = false;
-    int  pos       = 12;
-    while (pos + kChunkHeaderBytes <= head.size()) {
-        const QByteArray id   = head.mid(pos, 4);
-        const quint32    size = readU32(head, pos + 4);
-        const int        body = pos + kChunkHeaderBytes;
-        // 长度字段是 u32；大于 1 GiB 的单个块只可能是坏数据（传入的 head 也不会那么长）
-        if (size > 0x40000000u) return false;
-
-        if (id == QByteArrayLiteral("fmt ")) {
-            if (body + 16 > head.size()) return false;
-            quint16 audioFormat = readU16(head, body);
-            out.channels        = readU16(head, body + 2);
-            out.sampleRate      = static_cast<int>(readU32(head, body + 4));
-            out.bitsPerSample   = readU16(head, body + 14);
-            if (audioFormat == 0xFFFE) {
-                // WAVE_FORMAT_EXTENSIBLE：真正的小格式 tag 在 SubFormat GUID 的头两个字节
-                if (body + 26 > head.size()) return false;
-                audioFormat = readU16(head, body + 24);
-            }
-            if (audioFormat != 1) return false; // 浮点 / 压缩，交给 mpv
-            if (out.channels <= 0 || out.channels > 8) return false;
-            if (out.bitsPerSample <= 0 || out.bitsPerSample % 8 != 0) return false;
-            if (out.sampleRate <= 0 || out.sampleRate > 192000) return false;
-            sawFormat = true;
-        } else if (id == QByteArrayLiteral("data")) {
-            if (!sawFormat) return false;
-            out.dataOffset = body;
-            out.dataBytes  = static_cast<qint64>(size);
-            // 流式写入的 WAV 常把 data 长度留成 0 / 0xFFFFFFFF；这里标记为"未知"，由调用方按文件大小修正
-            if (out.dataBytes <= 0) out.dataBytes = -1;
-            return true;
-        }
-
-        pos = body + static_cast<int>(size) + static_cast<int>(size & 1u); // 块按偶数字节对齐
-    }
-    return false;
-}
 
 QByteArray extractChannel(const QByteArray& interleaved, int channels, int channel) {
     if (channels <= 1 || channel < 0 || channel >= channels) {
