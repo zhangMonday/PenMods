@@ -42,14 +42,27 @@ constexpr qint64 kDirectBytes = 8 * 1024 * 1024;
 /// 设备 /tmp 是 tmpfs（内存盘），再大就不该往里面写了。
 constexpr qint64 kTranscodeBytes   = 64 * 1024 * 1024;
 constexpr int    kTranscodeTimeout = 120000;
+/// 包装脚本自检的超时：真的执行一次 `/userdisk/VideoPlayer --version` 和一次转码探测。
+/// 真机上 mpv 起一次约百毫秒，3 秒只用于"它卡住了"这种异常；探测结果在进程内缓存，
+/// 整个进程最多付一次（最坏 3s×2，正常 0.3~1s，首次点「音频转文字」时）。
+constexpr int kMpvProbeTimeoutMs = 3000;
+
 /// 设备上的 mpv（外部视频播放器用的那个）。没有 ffmpeg CLI，转码只能借它。
-/// 但这台机器上它**不一定**在 `/userdisk/mpv/bin/mpv`：原厂通过 `/userdisk/VideoPlayer`
-/// 这个 shell 包装脚本启动 mpv，脚本里写的路径才是真正的可执行文件；有的固件把它放在 /oem 下，
-/// 也有人直接装到 PATH 里。硬编码单一路径时判不出来就只剩一句"无法访问 mpv"（真机反馈）。
 ///
-/// 探测顺序：固定候选 → `/userdisk/VideoPlayer` 脚本里引用的绝对路径 → PATH。
-/// 每一条都做过就记进 `tried`，找不到时整份列表进错误信息，方便用户在设备上核对。
-/// 只缓存**命中**的结果：没找到时下次重新探测（用户可能刚把 mpv 装进去）。
+/// 真机事实（YDP02X）：`command -v mpv` 为空、`/userdisk/VideoPlayer` 只有 **38 字节**
+/// （`ls -l` 为 `-rwxr-xr-x`），但外置播放器能正常播放 —— mpv 确实存在，只是由那个包装脚本
+/// exec 起来。上一轮"解析脚本里的绝对路径"没有兜住它（38 字节里可能根本没有绝对路径：
+/// `cd /userdisk/mpv && ./mpv "$@"`、`exec mpv "$@"` 靠 PATH、或者文件名带版本号）。
+///
+/// 现在的探测顺序：
+///   1. 固定候选路径（见过的固件布局）；
+///   2. 包装脚本里**任何**看起来像 mpv 的 token（正则 `[\w./-]*mpv[\w./-]*`，不假设脚本格式），
+///      逐个规范化 + 验证（绝对路径 / 存在 / 可执行）；
+///   3. 包装脚本自检：执行 `/userdisk/VideoPlayer --version`（再试 `-version`），
+///      能起来就把这条脚本本身当转码命令（QProcess argv[0] = 包装脚本，参数原样透传）；
+///   4. PATH 查找。
+/// 每一步的"候选 + 存在与否 + 解析结果"都记进 `tried`，失败时整份进错误信息与日志。
+/// 结果（命中或未命中）**进程内只探测一次**：转码失败反复重试时不再每次卡一次自检。
 
 /// 粗略估计 Ogg 时长：最后一个 "OggS" 页的 granulepos 就是 PCM 采样数（Opus 固定按 48 kHz 计）。
 /// 只用来判断"这个 Ogg 能不能整段直接上传"；估不出来返回 -1，调用方转码后按 WAV 正常切片。
@@ -220,43 +233,166 @@ void AsrService::_transcribeDirect(const QString& path) {
 
 namespace {
 
-/// 包装脚本里出现的绝对路径（/userdisk/VideoPlayer 是 `#!/bin/sh` + `exec .../mpv "$@"`）。
-/// 只认以 mpv 结尾的路径，避免把脚本里其它工具当转码器。
-QStringList mpvPathsFromWrapper(const QString& wrapperPath) {
-    QStringList paths;
-    QFile file(wrapperPath);
-    if (!file.open(QIODevice::ReadOnly)) return paths;
-    // 8 KiB 足够覆盖一段启动脚本；二进制包装脚本里的字符串也在这点范围内。
-    const QString text = QString::fromLatin1(file.read(8 * 1024));
-    file.close();
-    static const QRegularExpression re(QStringLiteral("(/[A-Za-z0-9._+/-]*/mpv)\\b"));
+/// QProcess 里的"程序能否起来且退出码为 0"自检。用于包装脚本：38 字节的 /userdisk/VideoPlayer
+/// 里可能一个绝对路径都没有（`cd /userdisk/mpv && ./mpv "$@"`、`exec mpv "$@"` 靠它自己的 PATH、
+/// 或者文件名带版本号），这时"脚本自己能跑起来"就是唯一可靠的判据。
+/// 先试 `--version` 再试 `-version`（老版本 mpv 只认后者）；超时就算失败，绝不让 UI 卡死。
+bool probeExecutable(const QString& program, int timeoutMs, QString& detail) {
+    static const char* const kVersionArgs[] = {"--version", "-version"};
+    for (const auto* arg : kVersionArgs) {
+        QProcess probe;
+        probe.setProcessChannelMode(QProcess::MergedChannels);
+        probe.start(program, {QString::fromLatin1(arg)});
+        if (!probe.waitForStarted(1200)) {
+            detail = QStringLiteral("%1 无法启动（%2）").arg(QString::fromLatin1(arg), probe.errorString());
+            continue;
+        }
+        if (!probe.waitForFinished(timeoutMs)) {
+            probe.kill();
+            probe.waitForFinished(300);
+            detail = QStringLiteral("%1 超时").arg(QString::fromLatin1(arg));
+            continue;
+        }
+        const auto out = QString::fromLatin1(probe.readAll()).trimmed();
+        if (probe.exitStatus() == QProcess::NormalExit && probe.exitCode() == 0) {
+            detail = QStringLiteral("%1 通过（%2）")
+                         .arg(QString::fromLatin1(arg), out.isEmpty() ? QStringLiteral("无输出") : out.left(40));
+            return true;
+        }
+        detail = QStringLiteral("%1 退出码 %2").arg(QString::fromLatin1(arg)).arg(probe.exitCode());
+    }
+    return false;
+}
+
+/// 真正调用 mpv 转码时用的参数（探测和实际转码共用同一份，避免"探测通过、实际跑不起来"）。
+QStringList transcodeArguments(const QString& outputPath, const QString& inputPath) {
+    return {
+        // --no-video            只要音频，避免打开任何视频输出
+        // --audio-samplerate=16 16 kHz（接口支持的采样率之一）
+        // --audio-channels=1    单声道（双声道文件接口只识别左声道，直接混成单声道更稳）
+        // --audio-format=s16    16-bit 有符号 PCM
+        // --ao=pcm / --ao-pcm-file= 用 pcm 音频输出落盘，默认带 WAV 头
+        // --no-config           不加载 /userdisk/mpv/config（那里配的是 wlshm 视频输出，与这里无关）
+        QStringLiteral("--no-config"),
+        QStringLiteral("--really-quiet"),
+        QStringLiteral("--no-video"),
+        QStringLiteral("--audio-samplerate=16000"),
+        QStringLiteral("--audio-channels=1"),
+        QStringLiteral("--audio-format=s16"),
+        QStringLiteral("--ao=pcm"),
+        QStringLiteral("--ao-pcm-file=") + outputPath,
+        inputPath,
+    };
+}
+
+/// 用**真实的转码参数**跑一次：输入是 0.1 秒静音 WAV，只验证"这条命令确实把参数透传给了 mpv
+/// 并把结果落成了 WAV"。`--version` 能通过、但脚本没写 `"$@"` 时真正的转码会静默失败
+/// （mpv 会去播放这个文件而不是转码），所以包装脚本必须按真实参数验证。
+bool probeTranscode(const QString& program, QString& detail) {
+    const QString tag    = generateUUID().left(8);
+    const QString input  = QDir::tempPath() + QStringLiteral("/penmods-mpv-in-%1.wav").arg(tag);
+    const QString output = QDir::tempPath() + QStringLiteral("/penmods-mpv-out-%1.wav").arg(tag);
+    QFile::remove(output);
+    {
+        QFile file(input);
+        if (!file.open(QIODevice::WriteOnly)) {
+            detail = QStringLiteral("无法写入探测音频");
+            return false;
+        }
+        // 16 kHz 单声道 16-bit，3200 字节 ≈ 0.1 秒静音
+        file.write(asr::buildWav(QByteArray(3200, '\0'), 16000, 1));
+    }
+    bool ok = false;
+    {
+        QProcess probe;
+        probe.setProcessChannelMode(QProcess::MergedChannels);
+        probe.start(program, transcodeArguments(output, input));
+        if (!probe.waitForStarted(1200)) {
+            detail = QStringLiteral("无法启动：%1").arg(probe.errorString());
+        } else if (!probe.waitForFinished(kMpvProbeTimeoutMs)) {
+            probe.kill();
+            probe.waitForFinished(300);
+            detail = QStringLiteral("转码探测超时");
+        } else {
+            const QFileInfo produced(output);
+            if (produced.exists() && produced.size() > 44) {
+                detail = QStringLiteral("通过（落盘 %1 字节）").arg(produced.size());
+                ok     = true;
+            } else {
+                const auto out = QString::fromLatin1(probe.readAll()).trimmed();
+                detail         = QStringLiteral("没有产生 WAV（退出码 %1%2）")
+                                     .arg(probe.exitCode())
+                                     .arg(out.isEmpty() ? QString() : QStringLiteral("，输出 ") + out.left(80));
+            }
+        }
+    }
+    QFile::remove(input);
+    QFile::remove(output);
+    return ok;
+}
+
+/// 从任意文本（包装脚本、二进制里的字符串）里抓"看起来像 mpv 的 token"。
+/// 不假设脚本格式：`[\w./-]*mpv[\w./-]*` 既能抓到 `/userdisk/mpv/bin/mpv`，也能抓到 `./mpv`、
+/// `mpv-0.36.0`、`/oem/YoudaoDictPen/output/mpv/bin/mpv`。
+QStringList mpvTokens(const QString& text) {
+    QStringList tokens;
+    static const QRegularExpression re(QStringLiteral("[A-Za-z0-9._+/-]*mpv[A-Za-z0-9._+-]*"));
     auto it = re.globalMatch(text);
     while (it.hasNext()) {
-        const auto match = it.next();
-        if (!paths.contains(match.captured(1))) paths << match.captured(1);
-        if (paths.size() >= 8) break; // 防御：脚本里塞满注释时不无限收集
+        const QString token = it.next().captured(0);
+        if (token.isEmpty() || tokens.contains(token)) continue;
+        tokens << token;
+        if (tokens.size() >= 16) break; // 防御：脚本里塞满注释时不无限收集
     }
-    return paths;
+    return tokens;
+}
+
+/// 把 token 规范化成绝对路径：绝对路径原样、`./mpv` 交待在包装脚本目录下、裸名字交给 PATH。
+/// 返回空串表示无法定位（例如 PATH 里没有这个裸名字）。
+QString resolveMpvToken(const QString& token, const QString& wrapperDir) {
+    if (token.isEmpty()) return {};
+    if (token.startsWith(QLatin1Char('/'))) return QDir::cleanPath(token);
+    if (token.startsWith(QStringLiteral("./")) || token.startsWith(QStringLiteral("../")))
+        return QDir::cleanPath(QDir(wrapperDir).absoluteFilePath(token));
+    return QStandardPaths::findExecutable(token);
+}
+
+/// 每个候选的人话状态，直接进失败信息，方便在设备上一眼看出是哪一步断的。
+QString describeMpvCandidate(const QString& path) {
+    const QFileInfo fi(path);
+    if (!fi.exists()) return path + QStringLiteral("（不存在）");
+    if (fi.isDir()) return path + QStringLiteral("（是目录）");
+    if (fi.size() == 0) return path + QStringLiteral("（空文件）");
+    if (!fi.isExecutable()) return path + QStringLiteral("（没有执行权限）");
+    return path + QStringLiteral("（可用）");
 }
 
 } // namespace
 
 QString AsrService::transcodeExecutable(QStringList& tried) {
-    tried.clear();
-    if (!mMpvExecutable.isEmpty() && QFileInfo(mMpvExecutable).isFile() && QFileInfo(mMpvExecutable).isExecutable()) {
-        tried << mMpvExecutable;
+    // 进程内只探测一次（命中与未命中都缓存）：转码失败重试、连点转文字都不再重复跑自检。
+    if (mMpvProbed) {
+        tried = mMpvTried;
         return mMpvExecutable;
     }
-    mMpvExecutable.clear();
+    mMpvProbed = true;
+    tried.clear();
 
-    const auto accept = [&tried](const QString& candidate) -> QString {
-        if (candidate.isEmpty() || !QFileInfo(candidate).isFile() || !QFileInfo(candidate).isExecutable()) return {};
-        if (!tried.contains(candidate)) tried << candidate;
-        return candidate;
+    const QString wrapper = QStringLiteral("/userdisk/VideoPlayer");
+    const auto    usable  = [](const QString& path) {
+        const QFileInfo fi(path);
+        return fi.isFile() && fi.isExecutable() && fi.size() > 0;
+    };
+    const auto finish = [this, &tried](const QString& path, const QString& how) {
+        info("音频转文字：使用 mpv {}（{}）", path.toStdString(), how.toStdString());
+        for (const auto& item : tried) info("[AsrMpv] {}", item.toStdString());
+        mMpvExecutable = path;
+        mMpvTried      = tried;
+        return path;
     };
 
-    // 1) 已知固定位置（原厂 YDP02X 是第一个；其余是见过的固件/手工安装布局）
-    QStringList known{
+    // 1) 固定候选位置（原厂 YDP02X 是第一个；其余是见过的固件/手工安装布局）
+    const QStringList known{
         QStringLiteral("/userdisk/mpv/bin/mpv"),
         QStringLiteral("/oem/mpv/bin/mpv"),
         QStringLiteral("/oem/YoudaoDictPen/output/mpv/bin/mpv"),
@@ -266,39 +402,76 @@ QString AsrService::transcodeExecutable(QStringList& tried) {
         QStringLiteral("/bin/mpv"),
     };
     for (const auto& candidate : known) {
-        // 只把"存在"的记进 tried；不存在的也记一份，错误信息里才能说明试过哪里
-        const QString found = accept(candidate);
-        if (!found.isEmpty()) {
-            info("音频转文字：使用 mpv {}", found.toStdString());
-            mMpvExecutable = found;
-            return found;
-        }
-        if (!tried.contains(candidate)) tried << candidate;
+        tried << describeMpvCandidate(candidate);
+        if (usable(candidate)) return finish(candidate, QStringLiteral("固定候选"));
     }
 
-    // 2) 原厂视频播放器的包装脚本：它 exec 的那个路径才是设备上真正的 mpv
-    for (const auto& wrapper : mpvPathsFromWrapper(QStringLiteral("/userdisk/VideoPlayer"))) {
-        const QString found = accept(wrapper);
-        if (!found.isEmpty()) {
-            info("音频转文字：从 /userdisk/VideoPlayer 解析到 mpv {}", found.toStdString());
-            mMpvExecutable = found;
-            return found;
+    // 2) 包装脚本里出现的 mpv 路径（不假设脚本格式，正则抓 token 后逐个验证）
+    QStringList wrapperTokens;
+    {
+        QFile file(wrapper);
+        if (!file.open(QIODevice::ReadOnly)) {
+            tried << QStringLiteral("包装脚本 %1（无法读取）").arg(wrapper);
+        } else {
+            const QString text = QString::fromLatin1(file.read(8 * 1024));
+            file.close();
+            wrapperTokens = mpvTokens(text);
+            QString preview = text;
+            preview.replace(QLatin1Char('\n'), QLatin1Char(' '));
+            preview.replace(QLatin1Char('\r'), QLatin1Char(' '));
+            if (preview.size() > 120) preview = preview.left(120) + QStringLiteral("…");
+            tried << QStringLiteral("包装脚本 %1（%2 字节，内容=\"%3\"）%4")
+                         .arg(wrapper)
+                         .arg(QFileInfo(wrapper).size())
+                         .arg(preview.trimmed())
+                         .arg(wrapperTokens.isEmpty() ? QStringLiteral("：未解析出 mpv 路径")
+                                                      : QStringLiteral("：解析出 %1").arg(wrapperTokens.join(QStringLiteral("、"))));
         }
-        if (!tried.contains(wrapper)) tried << wrapper;
+    }
+    for (const auto& token : wrapperTokens) {
+        const QString path = resolveMpvToken(token, QFileInfo(wrapper).absolutePath());
+        if (path.isEmpty()) {
+            tried << QStringLiteral("%1（无法定位：既不是绝对路径，PATH 里也没有）").arg(token);
+            continue;
+        }
+        tried << describeMpvCandidate(path);
+        if (usable(path)) return finish(path, QStringLiteral("包装脚本解析"));
     }
 
-    // 3) PATH（QStandardPaths 会按 PATH 顺序找可执行文件，不需要 fork 一个 shell）
+    // 3) 包装脚本自检：脚本里没有绝对路径时，"它自己能起来"就是判据。
+    //    先按**真实转码参数**跑一次（唯一能证明参数透传 + 落盘的判据），失败再跑 --version
+    //    把原因补全。通过就把包装脚本本身当转码命令（argv[0] = /userdisk/VideoPlayer）。
+    if (usable(wrapper)) {
+        _transcribeSetStatus(QStringLiteral("正在检测播放器…"));
+        QString detail;
+        if (probeTranscode(wrapper, detail)) {
+            tried << QStringLiteral("包装脚本 %1 转码自检：%2").arg(wrapper, detail);
+            return finish(wrapper, QStringLiteral("包装脚本转码自检通过"));
+        }
+        tried << QStringLiteral("包装脚本 %1 转码自检失败：%2").arg(wrapper, detail);
+        // 转码自检没通过但脚本自己起得来：仍然用它（这是设备上唯一的转码器，
+        // 真机要求是"不再报无 mpv"，转码结果由后面的落盘检查兜底）。
+        QString versionDetail;
+        if (probeExecutable(wrapper, kMpvProbeTimeoutMs, versionDetail)) {
+            tried << QStringLiteral("包装脚本 %1 --version：%2").arg(wrapper, versionDetail);
+            return finish(wrapper, QStringLiteral("包装脚本 --version 自检通过（转码落盘未验证）"));
+        }
+        tried << QStringLiteral("包装脚本 %1 --version 失败：%2").arg(wrapper, versionDetail);
+    } else {
+        tried << describeMpvCandidate(wrapper);
+    }
+
+    // 4) PATH
     const QString fromPath = QStandardPaths::findExecutable(QStringLiteral("mpv"));
     if (!fromPath.isEmpty()) {
-        const QString found = accept(fromPath);
-        if (!found.isEmpty()) {
-            info("音频转文字：从 PATH 找到 mpv {}", found.toStdString());
-            mMpvExecutable = found;
-            return found;
-        }
+        tried << describeMpvCandidate(fromPath);
+        if (usable(fromPath)) return finish(fromPath, QStringLiteral("PATH"));
     }
-    tried << QStringLiteral("PATH 中的 mpv");
+    tried << QStringLiteral("PATH 中的 mpv（没有）");
 
+    warn("音频转文字：没有找到可用的 mpv");
+    for (const auto& item : tried) warn("[AsrMpv] {}", item.toStdString());
+    mMpvTried = tried;
     return {};
 }
 
@@ -306,9 +479,11 @@ void AsrService::_transcribeTranscode(const QString& path) {
     QStringList mpvTried;
     const auto  mpv = transcodeExecutable(mpvTried);
     if (mpv.isEmpty()) {
-        _transcribeFail(
-            QStringLiteral("设备上没有找到可用的 mpv，无法转成 WAV（已尝试：%1）").arg(mpvTried.join(QStringLiteral("、")))
-        );
+        // 真机上"只报一句找不到 mpv"没法定位：这里把每个候选（存在与否）、包装脚本的解析结果与
+        // 自检结果、PATH 查找结果都摊开，同时整份写日志（grep [AsrMpv]）。
+        const auto detail = mpvTried.join(QStringLiteral("；"));
+        for (const auto& item : mpvTried) warn("[AsrMpv] {}", item.toStdString());
+        _transcribeFail(QStringLiteral("没有找到可用的 mpv，无法转成 WAV。诊断：") + detail);
         return;
     }
 
@@ -343,28 +518,11 @@ void AsrService::_transcribeTranscode(const QString& path) {
         _transcribeFail(QStringLiteral("音频转码超时"));
     });
 
-    // 待真机验证：以下 mpv 参数（0.36.0）在设备上的实际行为。
-    //   --no-video            只要音频，避免打开任何视频输出
-    //   --audio-samplerate=16 16 kHz（接口支持的采样率之一）
-    //   --audio-channels=1    单声道（双声道文件接口只识别左声道，直接混成单声道更稳）
-    //   --audio-format=s16    16-bit 有符号 PCM
-    //   --ao=pcm              用 pcm 音频输出落盘，默认带 WAV 头
-    //   --ao-pcm-file=<out>   落盘路径
-    //   --no-config           不加载 /userdisk/mpv/config（那里配的是 wlshm 视频输出，与这里无关）
-    const QStringList arguments{
-        QStringLiteral("--no-config"),
-        QStringLiteral("--really-quiet"),
-        QStringLiteral("--no-video"),
-        QStringLiteral("--audio-samplerate=16000"),
-        QStringLiteral("--audio-channels=1"),
-        QStringLiteral("--audio-format=s16"),
-        QStringLiteral("--ao=pcm"),
-        QStringLiteral("--ao-pcm-file=") + mTranscodeTemp,
-        path,
-    };
+    // 参数与包装脚本自检用同一份（transcodeArguments）：探测通过的命令 == 真正跑的命令。
+    const QStringList arguments = transcodeArguments(mTranscodeTemp, path);
     _transcribeSetStatus(QStringLiteral("正在转码…"));
     mTranscodeDeadline.start(kTranscodeTimeout);
-    info("音频转文字：开始 mpv 转码");
+    info("音频转文字：开始转码（命令 {}）", mpv.toStdString());
     process->start(mpv, arguments);
 }
 

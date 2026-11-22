@@ -381,11 +381,22 @@ void CameraCapture::onScanComplete() {
         if (upperHeight <= 0 || lowerHeight <= 0 || upperWidth <= 0 || lowerWidth <= 0
             || qint64(upperHeight) + lowerHeight != frameSize.height()
             || std::max(upperWidth, lowerWidth) != frameSize.width()) {
-            postScanResult(seq, {}, "无法确定原图与校正图区域，请在设置中选择不裁剪后重试");
-            return;
+            // 这里以前直接失败（"无法确定原图与校正图区域"）。但落图的目的是把这一次扫描的图交给
+            // 拍摄页，裁剪区域只是"少留一段重复画面"的优化：几何读不到时用整图，比丢掉整张图好得多
+            // （真机反馈的"约一半扫描取不到图"里就有这一条）。cropRect 保持空 = 不裁剪。
+            spdlog::warn(
+                "[CameraCapture] scan {} 裁剪区域与整图尺寸不一致（{}x{} vs {}x{}），改为使用整图",
+                seq,
+                upperWidth,
+                upperHeight,
+                frameSize.width(),
+                frameSize.height()
+            );
+            cropRect = QRect();
+        } else {
+            cropRect =
+                cropMode == 1 ? QRect(0, 0, upperWidth, upperHeight) : QRect(0, upperHeight, lowerWidth, lowerHeight);
         }
-        cropRect =
-            cropMode == 1 ? QRect(0, 0, upperWidth, upperHeight) : QRect(0, upperHeight, lowerWidth, lowerHeight);
     }
 
     dispatchScanFrame(seq, raw, cropRect);
@@ -476,6 +487,8 @@ void CameraCapture::emitScanResult(quint64 seq, const QString& data, const QStri
             spdlog::warn("[CameraCapture] onScanComplete: {}", result.second.toStdString());
             emit captureFailed(result.second);
         } else {
+            // QML 在 onImageCaptured 槽里同步读 lastImageSeq()，用来判断这张图是不是"这一次扫描"的。
+            mLastImageSeq = seq;
             emit imageCaptured(result.first);
         }
     }

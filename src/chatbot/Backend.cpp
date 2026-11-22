@@ -2453,28 +2453,63 @@ QString extractSessionTitle(const QJsonObject& object) {
     return nonEmpty(object.value("response").toObject().value("title"));
 }
 
-// 用户元信息标记（latest_reminder）：<date>,<weekday>,<location>,<platform>,<language>。
-// 我们不知道用户所在地，location 留空（官方允许为空）；平台固定 App；星期与 language 必须同一种语言，
-// 否则服务端按格式不符返回 400。只支持中文/英文，其他语言回退 English（星期也回退英文，保持成对）。
-QString buildLatestReminderContent() {
+struct MetaMarkerParts {
+    QString date;     ///< yyyy-MM-dd（北京时间）
+    QString time;     ///< HH:mm（北京时间，24 小时制）
+    QString weekday;  ///< 与 language 同语言：星期日 / Sunday
+    QString language; ///< 中文 / 中文繁體 / 中文香港 / English
+};
+
+/// 星期与 language 必须同一种语言，否则官方 latest_reminder 按格式不符返回 400。
+/// 只支持中文/英文，其他语言回退 English（星期也回退英文，保持成对）。
+///
+/// **时间固定算北京时间（UTC+8）**：设备通常没有把时区配成 Asia/Shanghai（有的甚至停在 UTC），
+/// 直接用 QDateTime::currentDateTime() 会把"现在几点"讲错。地点留空：设备没有定位能力。
+MetaMarkerParts buildMetaMarkerParts() {
     static const char* const zhWeekdays[] = {"星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"};
     static const char* const enWeekdays[] = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
                                              "Sunday"};
-    const QDate today = QDate::currentDate();
-    int         index = today.dayOfWeek() - 1;
+    // QTimeZone 的固定偏移构造在 Qt 5.15 上没有 fromSecondsAheadOfUtc，这里直接按 UTC+8 平移：
+    // 平移后的 date()/time() 就是北京时间的年月日时分，不依赖设备的时区/chrony 设置。
+    const QDateTime beijing = QDateTime::currentDateTimeUtc().addSecs(8 * 60 * 60);
+
+    MetaMarkerParts parts;
+    parts.date = beijing.date().toString(QStringLiteral("yyyy-MM-dd"));
+    parts.time = beijing.time().toString(QStringLiteral("HH:mm"));
+    int index  = beijing.date().dayOfWeek() - 1;
     if (index < 0 || index > 6) index = 0;
 
     const QString localeName = QLocale::system().name();
-    QString       language   = QStringLiteral("English");
-    QString       weekday    = QString::fromLatin1(enWeekdays[index]);
+    parts.language           = QStringLiteral("English");
+    parts.weekday            = QString::fromLatin1(enWeekdays[index]);
     if (localeName.startsWith(QStringLiteral("zh"))) {
-        language = localeName == QStringLiteral("zh_TW")   ? QStringLiteral("中文繁體")
-                   : localeName == QStringLiteral("zh_HK") ? QStringLiteral("中文香港")
-                                                           : QStringLiteral("中文");
-        weekday = QString::fromUtf8(zhWeekdays[index]);
+        parts.language = localeName == QStringLiteral("zh_TW")   ? QStringLiteral("中文繁體")
+                         : localeName == QStringLiteral("zh_HK") ? QStringLiteral("中文香港")
+                                                                 : QStringLiteral("中文");
+        parts.weekday  = QString::fromUtf8(zhWeekdays[index]);
     }
-    return today.toString(QStringLiteral("yyyy-MM-dd")) + QStringLiteral(",") + weekday + QStringLiteral(",,App,")
-           + language;
+    return parts;
+}
+
+// 用户元信息标记（latest_reminder）：<date>,<weekday>,<location>,<platform>,<language>。
+// 我们不知道用户所在地，location 留空（官方允许为空）；平台固定 App。
+QString buildLatestReminderContent() {
+    const auto parts = buildMetaMarkerParts();
+    return parts.date + QStringLiteral(",") + parts.weekday + QStringLiteral(",,App,") + parts.language;
+}
+
+// 不支持 latest_reminder 的协议（Responses API 被官方明确排除；此外还有第三方/中转端点）改用
+// 一条 **system 消息**：任何协议的 `messages`/`input` 都接受 role=system，作用与元信息标记相同，
+// 还能顺带把"现在几点"讲清楚（latest_reminder 格式里只有日期）。内容刻意保持独立、
+// 不复述系统提示词，避免与 m_defaultPrompt 重复。
+QString buildMetaSystemContent() {
+    const auto    parts = buildMetaMarkerParts();
+    const QString zone  = parts.language == QLatin1String("English") ? QStringLiteral("Beijing time, UTC+8")
+                                                                     : QStringLiteral("北京时间 UTC+8");
+    return QStringLiteral("以下是设备当前的元信息，仅在需要判断\"今天/现在\"时参考，不要复述给用户："
+                          "日期 %1，时间 %2，星期 %3（%4）；平台 App；地点未提供（设备没有定位）；"
+                          "用户语言 %5。")
+        .arg(parts.date, parts.time, parts.weekday, zone, parts.language);
 }
 
 // 新建会话的占位标题不算“已有标题”：原生标题/本地自动标题都可以覆盖它。
@@ -2968,20 +3003,36 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     // 适配判据只算一次：所有 DeepSeek 专有字段都受它保护（开关 + 官方域名双门槛）
     const bool deepseekAdapter = deepseekAdapterActive();
 
-    // latest_reminder（用户元信息标记）：Responses API 不支持；必须紧挨在它所属的 user 消息之前，
-    // 所以只在最后一条是 user 时插入，避免“夹在 tool_use 与 tool_result 之间”的 400。
-    if (deepseekAdapter && m_capMetaMarker && !usesResponsesApi() && !safeMessages.isEmpty()
+    // 元信息标记（设置页「元信息标记」开关，caps.metaMarker）。两条路都必须紧挨在它所属的
+    // user 消息之前，且只在最后一条是 user 时插入，避免“夹在 tool_use 与 tool_result 之间”的 400。
+    //   • DeepSeek 官方 + chat_completions：用官方 latest_reminder（<date>,<weekday>,<loc>,<platform>,<lang>）。
+    //   • 其余全部协议（Responses 被官方明确排除，第三方/中转端点也不认这个 role）：
+    //     改为注入一条 **system** 消息。任何协议都接受 role=system，效果等价而且能带上"现在几点"。
+    //     上一轮在 Responses 下直接把这个开关藏起来（"仍无效果、甚至开关都不见了"），现在两条路都有。
+    if (m_capMetaMarker && !safeMessages.isEmpty()
         && safeMessages.last().toObject().value("role").toString() == QStringLiteral("user")) {
-        // 官方格式（用户元信息标记指南）：<date>,<weekday>,<location>,<platform>,<language>，
-        // 必须是 messages 里紧挨在该 user 消息之前的一条 `role: "latest_reminder"`。
-        // 位置、字符串形态、协议（Responses 不支持）三条都对得上；这里再打一行 debug，
-        // 设备日志里 grep "latest_reminder" 就能确认它到底有没有随请求发出去。
-        const QString reminder = buildLatestReminderContent();
-        safeMessages.insert(
-            safeMessages.size() - 1,
-            QJsonObject{{"role", QStringLiteral("latest_reminder")}, {"content", reminder}}
-        );
-        debug("latest_reminder 已插入最后一条 user 消息之前: {}", reminder.toStdString());
+        const bool useLatestReminder = deepseekAdapter && !usesResponsesApi();
+        if (useLatestReminder) {
+            const QString reminder = buildLatestReminderContent();
+            safeMessages.insert(
+                safeMessages.size() - 1,
+                QJsonObject{{"role", QStringLiteral("latest_reminder")}, {"content", reminder}}
+            );
+            // 用 info 而不是 debug：release 构建默认只打 info，这样设备日志里 grep "[MetaMarker]"
+            // 就能确认元信息到底有没有随请求发出去。
+            info("[MetaMarker] latest_reminder 已插入最后一条 user 之前: {}", reminder.toStdString());
+        } else {
+            const QString meta = buildMetaSystemContent();
+            safeMessages.insert(
+                safeMessages.size() - 1,
+                QJsonObject{{"role", QStringLiteral("system")}, {"content", meta}}
+            );
+            info(
+                "[MetaMarker] system 消息已注入最后一条 user 之前（protocol={}）: {}",
+                usesResponsesApi() ? "responses" : "chat_completions",
+                meta.toStdString()
+            );
+        }
     }
 
     QJsonObject requestBody;

@@ -309,6 +309,10 @@ bool KeyBoard::stopVoiceInput(QObject* speechManager) {
 
 PEN_HOOK(uint64, _ZN7YGlobal14showSpeechPageEv, uint64 self) {
     if (mod::KeyBoard::getInstance().isStartingVoiceInput()) return 0;
+    // 语音助手页 / 长按的 DeepSeek 接管已经放弃页面（改为气泡反馈）：会话进行中不要再让原厂
+    // 打开那一页 —— 我们只接管采集，页面一旦出现就没有原厂录音在跑，会一直停在"聆听中"。
+    // 会话结束后（Idle）这个判断为 false，原厂链路完全照旧。
+    if (mod::AsrService::getInstance().shouldSuppressVendorSpeechPage()) return 0;
     return origin(self);
 }
 

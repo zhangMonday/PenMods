@@ -50,6 +50,11 @@ public:
 
     Q_INVOKABLE void stitchImagesAsync(quint64 requestId, const QStringList& imageList, const QString& direction);
 
+    /// 最近一次 `imageCaptured` 携带的扫描序号（每次 onScanComplete 自增一次）。
+    /// QML 在 onImageCaptured 里同步读取它就能把落图和"这一次扫描"对上，从而丢弃上一次
+    /// 扫描排队到现在的残留图（异步落图 + 连续扫描时，先到的图不一定是本次扫描的）。
+    [[nodiscard]] Q_INVOKABLE quint64 lastImageSeq() const { return mLastImageSeq; }
+
 signals:
 
     void captureEnabledChanged();
@@ -90,6 +95,8 @@ private:
     // UI-thread only: results waiting for their predecessor so emission order == scan order.
     quint64                                 mNextScanEmit = 0;
     QHash<quint64, QPair<QString, QString>> mPendingScanResults;
+    // UI-thread only: 最近一次 imageCaptured 的序号（见 lastImageSeq()）。
+    quint64 mLastImageSeq = 0;
 };
 
 } // namespace mod::capture
