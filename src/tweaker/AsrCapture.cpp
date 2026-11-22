@@ -47,6 +47,24 @@ constexpr int kSilencePeak       = 300;
 constexpr int kSilenceAfterMs    = 2000;
 constexpr int kSilenceMinTotalMs = 1200;
 
+/// 设备/格式探测的缓存。
+/// `QAudioDeviceInfo::defaultInputDevice()` 会枚举 ALSA 设备，`isFormatSupported()` 会真的打开
+/// PCM 设备做一次格式协商 —— 两步加起来在设备上是几百毫秒。以前每次按语音键都要付一遍，
+/// 表现就是"键盘语音按钮点击非常卡顿"。设备热插拔在这个笔上不会发生，所以缓存住；
+/// QAudioInput 真起不来时清掉缓存，下一次重新探测。
+struct AudioProbe {
+    bool             valid = false;
+    QAudioDeviceInfo device;
+    QAudioFormat     format;
+};
+
+AudioProbe& audioProbeCache() {
+    static AudioProbe cache;
+    return cache;
+}
+
+void invalidateAudioProbeCache() { audioProbeCache().valid = false; }
+
 } // namespace
 
 int AsrCapture::maxCaptureMs() { return kMaxCaptureMs; }
@@ -55,25 +73,22 @@ AsrCapture::AsrCapture(QObject* parent) : QObject(parent) { mError = QStringLite
 
 AsrCapture::~AsrCapture() { abort(); }
 
-bool AsrCapture::start(QString& reason) {
-    if (mInputAudio) {
-        reason = QStringLiteral("语音识别正在录音");
-        return false;
+/// 把"设备 + 可用格式"探测出来（结果缓存，见 AudioProbe 的注释）。
+/// 返回 false 时 reason 里是可以直接弹给用户的原因。
+static bool probeCapture(const QString& microphoneMissingReason, QAudioDeviceInfo& device, QAudioFormat& format, QString& reason) {
+    auto& cache = audioProbeCache();
+    if (cache.valid) {
+        device = cache.device;
+        format = cache.format;
+        return true;
     }
 
-    // 与 PenMods 录音机互斥：同一时刻只能有一个进程内采集器打开 ALSA 捕获设备。
-    if (AudioRecorder::getInstance().isWorking()) {
-        reason = QStringLiteral("录音机正在录音，语音识别暂不可用");
-        return false;
-    }
-
-    const auto device = QAudioDeviceInfo::defaultInputDevice();
+    device = QAudioDeviceInfo::defaultInputDevice();
     if (device.isNull() || device.deviceName().isEmpty()) {
-        reason = QStringLiteral("没有可用的麦克风");
+        reason = microphoneMissingReason;
         return false;
     }
 
-    QAudioFormat format;
     format.setSampleRate(kSampleRate);
     format.setSampleSize(kSampleSize);
     format.setSampleType(QAudioFormat::SignedInt);
@@ -96,6 +111,38 @@ bool AsrCapture::start(QString& reason) {
         }
         format = nearest;
     }
+
+    cache.device = device;
+    cache.format = format;
+    cache.valid  = true;
+    return true;
+}
+
+void AsrCapture::warmUp() {
+    QString         reason;
+    QAudioDeviceInfo device;
+    QAudioFormat     format;
+    if (!probeCapture(QStringLiteral("没有可用的麦克风"), device, format, reason))
+        spdlog::warn("语音识别设备预热失败：{}", reason.toStdString());
+    else
+        spdlog::debug("语音识别设备预热完成：{}", device.deviceName().toStdString());
+}
+
+bool AsrCapture::start(QString& reason) {
+    if (mInputAudio) {
+        reason = QStringLiteral("语音识别正在录音");
+        return false;
+    }
+
+    // 与 PenMods 录音机互斥：同一时刻只能有一个进程内采集器打开 ALSA 捕获设备。
+    if (AudioRecorder::getInstance().isWorking()) {
+        reason = QStringLiteral("录音机正在录音，语音识别暂不可用");
+        return false;
+    }
+
+    QAudioDeviceInfo device;
+    QAudioFormat     format;
+    if (!probeCapture(QStringLiteral("没有可用的麦克风"), device, format, reason)) return false;
 
     mSampleRate = format.sampleRate();
     mChannels   = qMax(1, format.channelCount());
@@ -124,6 +171,7 @@ bool AsrCapture::start(QString& reason) {
     if (!mInputDevice) {
         mError = QStringLiteral("无法打开麦克风");
         reason = mError;
+        invalidateAudioProbeCache(); // 设备布局可能变了：下次重新探测
         _release();
         return false;
     }

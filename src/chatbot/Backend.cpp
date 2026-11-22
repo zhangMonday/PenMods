@@ -836,6 +836,7 @@ bool ChatBot::writeSessions(const QMap<QString, SessionData>& sessions, const QS
                                 && old->createdAt == session.createdAt && old->updatedAt == session.updatedAt
                                 && old->lastConversationAt == session.lastConversationAt
                                 && old->manualTitle == session.manualTitle
+                                && old->previewTitle == session.previewTitle
                                 && old->completedRounds == session.completedRounds
                                 && old->titleAttemptRound == session.titleAttemptRound
                                 && old->lastCompletedUserId == session.lastCompletedUserId
@@ -850,6 +851,7 @@ bool ChatBot::writeSessions(const QMap<QString, SessionData>& sessions, const QS
                     {"updatedAt",           session.updatedAt.toStdString()          },
                     {"lastConversationAt",  session.lastConversationAt.toStdString() },
                     {"manualTitle",         session.manualTitle                      },
+                    {"previewTitle",        session.previewTitle                     },
                     {"completedRounds",     session.completedRounds                  },
                     {"titleAttemptRound",   session.titleAttemptRound                },
                     {"lastCompletedUserId", session.lastCompletedUserId.toStdString()},
@@ -928,6 +930,9 @@ bool ChatBot::loadSession(const json& sessionObj, const QString& fileName) {
         QString::fromStdString(sessionObj.value("lastConversationAt", session.updatedAt.toStdString()));
     session.manualTitle =
         sessionObj.value("manualTitle", session.title != "新对话" && session.title != "未命名对话");
+    // 旧数据没有这个字段：一律 false（旧会话的标题可能正是当时兜出来的预览串，
+    // 那一轮的原生标题早已错过，不需要再回头改写）。
+    session.previewTitle = sessionObj.value("previewTitle", false);
     session.completedRounds     = std::max(0, sessionObj.value("completedRounds", 0));
     session.titleAttemptRound   = std::max(0, sessionObj.value("titleAttemptRound", 0));
     session.lastCompletedUserId = QString::fromStdString(sessionObj.value("lastCompletedUserId", ""));
@@ -2967,10 +2972,16 @@ void ChatBot::makeApiRequest(const QJsonArray& messages) {
     // 所以只在最后一条是 user 时插入，避免“夹在 tool_use 与 tool_result 之间”的 400。
     if (deepseekAdapter && m_capMetaMarker && !usesResponsesApi() && !safeMessages.isEmpty()
         && safeMessages.last().toObject().value("role").toString() == QStringLiteral("user")) {
+        // 官方格式（用户元信息标记指南）：<date>,<weekday>,<location>,<platform>,<language>，
+        // 必须是 messages 里紧挨在该 user 消息之前的一条 `role: "latest_reminder"`。
+        // 位置、字符串形态、协议（Responses 不支持）三条都对得上；这里再打一行 debug，
+        // 设备日志里 grep "latest_reminder" 就能确认它到底有没有随请求发出去。
+        const QString reminder = buildLatestReminderContent();
         safeMessages.insert(
             safeMessages.size() - 1,
-            QJsonObject{{"role", QStringLiteral("latest_reminder")}, {"content", buildLatestReminderContent()}}
+            QJsonObject{{"role", QStringLiteral("latest_reminder")}, {"content", reminder}}
         );
+        debug("latest_reminder 已插入最后一条 user 消息之前: {}", reminder.toStdString());
     }
 
     QJsonObject requestBody;
@@ -5114,15 +5125,17 @@ void ChatBot::completedRound() {
     // 只在确实请求过原生标题、且服务端没给标题的会话上做一次（有标题 / 手动改名都不覆盖）。
     const auto sessionId = m_currentSessionId;
     if (getDeepseekSessionTitleActive() && m_nativeTitleRequested.contains(sessionId)
-        && isPlaceholderSessionTitle(session.title) && !session.manualTitle) {
+        && (isPlaceholderSessionTitle(session.title) || session.previewTitle) && !session.manualTitle) {
         // 只用用户正文：附件上下文（parts 里的 text 段）是“用户引用了以下文件…”这类机器文本，
         // 拿来当标题没有意义。
         for (const auto& message : session.messages) {
             if (message.role != "user") continue;
             const QString text = message.content.simplified();
             if (text.isEmpty()) continue;
-            session.title     = text.left(16);
-            session.updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+            session.title        = text.left(16);
+            // 兜底标题也是预览性质（官方指南："响应不一定带标题，请自行兜底"）。
+            session.previewTitle = true;
+            session.updatedAt    = QDateTime::currentDateTime().toString(Qt::ISODate);
             emit sessionsChanged();
             break;
         }
@@ -5435,9 +5448,14 @@ bool ChatBot::deleteSession(const QString& sessionId) {
 bool ChatBot::setSessionPreviewTitle(const QString& sessionId, const QString& newTitle) {
     if (!m_sessions.contains(sessionId) || newTitle.trimmed().isEmpty()) return false;
     auto& session = m_sessions[sessionId];
-    if (session.manualTitle || !session.title.startsWith("新对话")) return false;
-    session.title     = newTitle.trimmed();
-    session.updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
+    // 只覆盖"还没标题"的会话：手动改名（manualTitle）和已经兜过预览串的都不再改。
+    if (session.manualTitle || !isPlaceholderSessionTitle(session.title)) return false;
+    session.title        = newTitle.trimmed();
+    // 标记成预览：DeepSeek 原生标题回来时必须能覆盖它。以前没有这个标记，
+    // 于是响应里的标题被 applyNativeSessionTitle() 的"已有标题就不覆盖"判成已存在 ——
+    // 真机上就是"开与不开没区别"（列表里永远是发送时那句用户原话）。
+    session.previewTitle = true;
+    session.updatedAt    = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();
     emit sessionsChanged();
     return true;
@@ -5600,8 +5618,14 @@ QString ChatBot::sanitizeAnswerText(const QString& text) const {
 
 bool ChatBot::nativeTitleRequestWanted() const {
     if (!getDeepseekSessionTitleActive()) return false;
-    // 是否自动生成标题仍由外层 ai.auto_title.enabled 决定：原生标题只替换“标题模型”，不改变总开关语义。
-    if (!getAutoTitleEnabled()) return false;
+    // 「会话标题」这个模型能力开关本身就是授权，不再要求外层 ai.auto_title.enabled：
+    // 后者默认是 false（见 Config 默认值），再要求它等于让原生标题默认永远静默 ——
+    // 真机反馈"开了没区别"的一半原因就是这个。冻结语义也没变：原生标题生效期间
+    // requestAutoTitle() 会跳过本会话，不需要外层开关来"关掉"本地标题模型。
+    // 官方文档核对（2026-11-22）：请求体是 "title": {"enabled": true}，
+    // Chat Completions 流式取最后一个 chunk 的 choices[0].delta.title、非流式取
+    // choices[0].message.title；Responses/Messages 取顶层 title 或 response.title ——
+    // 与本文件的 extractSessionTitle() 一致。
     if (!m_sessions.contains(m_currentSessionId)) return false;
     const auto& session = m_sessions[m_currentSessionId];
     if (session.manualTitle || !isPlaceholderSessionTitle(session.title) || session.completedRounds > 0) return false;
@@ -5615,7 +5639,11 @@ void ChatBot::applyNativeSessionTitle(const QString& title) {
     if (!m_sessions.contains(m_currentSessionId)) return;
     auto& session = m_sessions[m_currentSessionId];
     // 手动改名优先，与本地自动标题同样的保护；已经有真实标题也不覆盖。
-    if (session.manualTitle || !isPlaceholderSessionTitle(session.title)) return;
+    // 但"发送时用用户原话兜出来的预览标题"必须能被覆盖：那条预览串在请求发出时就写进
+    // session.title 了，而原生标题要等响应回来，否则这里永远判定"已有标题"而丢弃。
+    if (session.manualTitle) return;
+    if (!isPlaceholderSessionTitle(session.title) && !session.previewTitle) return;
+    session.previewTitle = false;
     session.title     = value.left(32);
     session.updatedAt = QDateTime::currentDateTime().toString(Qt::ISODate);
     saveSessions();

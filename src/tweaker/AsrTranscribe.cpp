@@ -25,7 +25,9 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QSaveFile>
+#include <QStandardPaths>
 
 namespace mod {
 
@@ -41,7 +43,13 @@ constexpr qint64 kDirectBytes = 8 * 1024 * 1024;
 constexpr qint64 kTranscodeBytes   = 64 * 1024 * 1024;
 constexpr int    kTranscodeTimeout = 120000;
 /// 设备上的 mpv（外部视频播放器用的那个）。没有 ffmpeg CLI，转码只能借它。
-constexpr auto kMpvPath = "/userdisk/mpv/bin/mpv";
+/// 但这台机器上它**不一定**在 `/userdisk/mpv/bin/mpv`：原厂通过 `/userdisk/VideoPlayer`
+/// 这个 shell 包装脚本启动 mpv，脚本里写的路径才是真正的可执行文件；有的固件把它放在 /oem 下，
+/// 也有人直接装到 PATH 里。硬编码单一路径时判不出来就只剩一句"无法访问 mpv"（真机反馈）。
+///
+/// 探测顺序：固定候选 → `/userdisk/VideoPlayer` 脚本里引用的绝对路径 → PATH。
+/// 每一条都做过就记进 `tried`，找不到时整份列表进错误信息，方便用户在设备上核对。
+/// 只缓存**命中**的结果：没找到时下次重新探测（用户可能刚把 mpv 装进去）。
 
 /// 粗略估计 Ogg 时长：最后一个 "OggS" 页的 granulepos 就是 PCM 采样数（Opus 固定按 48 kHz 计）。
 /// 只用来判断"这个 Ogg 能不能整段直接上传"；估不出来返回 -1，调用方转码后按 WAV 正常切片。
@@ -64,7 +72,7 @@ double oggDurationSeconds(const QString& path) {
 } // namespace
 
 QString AsrService::transcribeUnavailableReason() const {
-    if (!mEnabled) return QStringLiteral("请先在「设置 → 显示与输入 → 语言识别」里开启 DeepSeek 语音识别");
+    if (!mEnabled) return QStringLiteral("请先在「设置 → 显示与输入 → 语音识别」里开启 DeepSeek 语音识别");
     if (!hasApiKey()) return QStringLiteral("未配置 DeepSeek API Key");
     if (mTranscribeBusy) return QStringLiteral("正在转写，请稍候");
     return {};
@@ -210,9 +218,97 @@ void AsrService::_transcribeDirect(const QString& path) {
     _transcribeTranscode(path);
 }
 
+namespace {
+
+/// 包装脚本里出现的绝对路径（/userdisk/VideoPlayer 是 `#!/bin/sh` + `exec .../mpv "$@"`）。
+/// 只认以 mpv 结尾的路径，避免把脚本里其它工具当转码器。
+QStringList mpvPathsFromWrapper(const QString& wrapperPath) {
+    QStringList paths;
+    QFile file(wrapperPath);
+    if (!file.open(QIODevice::ReadOnly)) return paths;
+    // 8 KiB 足够覆盖一段启动脚本；二进制包装脚本里的字符串也在这点范围内。
+    const QString text = QString::fromLatin1(file.read(8 * 1024));
+    file.close();
+    static const QRegularExpression re(QStringLiteral("(/[A-Za-z0-9._+/-]*/mpv)\\b"));
+    auto it = re.globalMatch(text);
+    while (it.hasNext()) {
+        const auto match = it.next();
+        if (!paths.contains(match.captured(1))) paths << match.captured(1);
+        if (paths.size() >= 8) break; // 防御：脚本里塞满注释时不无限收集
+    }
+    return paths;
+}
+
+} // namespace
+
+QString AsrService::transcodeExecutable(QStringList& tried) {
+    tried.clear();
+    if (!mMpvExecutable.isEmpty() && QFileInfo(mMpvExecutable).isFile() && QFileInfo(mMpvExecutable).isExecutable()) {
+        tried << mMpvExecutable;
+        return mMpvExecutable;
+    }
+    mMpvExecutable.clear();
+
+    const auto accept = [&tried](const QString& candidate) -> QString {
+        if (candidate.isEmpty() || !QFileInfo(candidate).isFile() || !QFileInfo(candidate).isExecutable()) return {};
+        if (!tried.contains(candidate)) tried << candidate;
+        return candidate;
+    };
+
+    // 1) 已知固定位置（原厂 YDP02X 是第一个；其余是见过的固件/手工安装布局）
+    QStringList known{
+        QStringLiteral("/userdisk/mpv/bin/mpv"),
+        QStringLiteral("/oem/mpv/bin/mpv"),
+        QStringLiteral("/oem/YoudaoDictPen/output/mpv/bin/mpv"),
+        QStringLiteral("/userdisk/mpv/mpv"),
+        QStringLiteral("/usr/bin/mpv"),
+        QStringLiteral("/usr/local/bin/mpv"),
+        QStringLiteral("/bin/mpv"),
+    };
+    for (const auto& candidate : known) {
+        // 只把"存在"的记进 tried；不存在的也记一份，错误信息里才能说明试过哪里
+        const QString found = accept(candidate);
+        if (!found.isEmpty()) {
+            info("音频转文字：使用 mpv {}", found.toStdString());
+            mMpvExecutable = found;
+            return found;
+        }
+        if (!tried.contains(candidate)) tried << candidate;
+    }
+
+    // 2) 原厂视频播放器的包装脚本：它 exec 的那个路径才是设备上真正的 mpv
+    for (const auto& wrapper : mpvPathsFromWrapper(QStringLiteral("/userdisk/VideoPlayer"))) {
+        const QString found = accept(wrapper);
+        if (!found.isEmpty()) {
+            info("音频转文字：从 /userdisk/VideoPlayer 解析到 mpv {}", found.toStdString());
+            mMpvExecutable = found;
+            return found;
+        }
+        if (!tried.contains(wrapper)) tried << wrapper;
+    }
+
+    // 3) PATH（QStandardPaths 会按 PATH 顺序找可执行文件，不需要 fork 一个 shell）
+    const QString fromPath = QStandardPaths::findExecutable(QStringLiteral("mpv"));
+    if (!fromPath.isEmpty()) {
+        const QString found = accept(fromPath);
+        if (!found.isEmpty()) {
+            info("音频转文字：从 PATH 找到 mpv {}", found.toStdString());
+            mMpvExecutable = found;
+            return found;
+        }
+    }
+    tried << QStringLiteral("PATH 中的 mpv");
+
+    return {};
+}
+
 void AsrService::_transcribeTranscode(const QString& path) {
-    if (!QFileInfo::exists(QString::fromLatin1(kMpvPath))) {
-        _transcribeFail(QStringLiteral("设备上没有 mpv，无法把这个音频转成 WAV"));
+    QStringList mpvTried;
+    const auto  mpv = transcodeExecutable(mpvTried);
+    if (mpv.isEmpty()) {
+        _transcribeFail(
+            QStringLiteral("设备上没有找到可用的 mpv，无法转成 WAV（已尝试：%1）").arg(mpvTried.join(QStringLiteral("、")))
+        );
         return;
     }
 
@@ -235,10 +331,10 @@ void AsrService::_transcribeTranscode(const QString& path) {
         _transcribeOnTranscodeFinished();
     });
     // 进程起不来时 Qt 不会发 finished（只有 errorOccurred），不能干等转码超时
-    connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError error) {
+    connect(process, &QProcess::errorOccurred, this, [this, process, mpv](QProcess::ProcessError error) {
         if (mTranscode != process) return;
         if (error == QProcess::FailedToStart)
-            _transcribeFail(QStringLiteral("无法启动 mpv，请检查 /userdisk/mpv/bin/mpv"));
+            _transcribeFail(QStringLiteral("无法启动 mpv（%1），请检查该文件是否可执行").arg(mpv));
     });
     mTranscodeDeadline.setSingleShot(true);
     disconnect(&mTranscodeDeadline, nullptr, this, nullptr);
@@ -269,7 +365,7 @@ void AsrService::_transcribeTranscode(const QString& path) {
     _transcribeSetStatus(QStringLiteral("正在转码…"));
     mTranscodeDeadline.start(kTranscodeTimeout);
     info("音频转文字：开始 mpv 转码");
-    process->start(QString::fromLatin1(kMpvPath), arguments);
+    process->start(mpv, arguments);
 }
 
 void AsrService::_transcribeOnTranscodeFinished() {

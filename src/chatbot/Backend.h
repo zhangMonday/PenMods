@@ -71,6 +71,9 @@ struct SessionData {
     QString              updatedAt;
     QString              lastConversationAt;
     bool                 manualTitle       = false;
+    /// 标题是"发送时用用户原话前几十字兜出来的预览"（QML setSessionPreviewTitle），
+    /// 不是真正生成/用户改过的标题：原生会话标题到了以后应当覆盖它。
+    bool                 previewTitle      = false;
     int                  completedRounds   = 0;
     int                  titleAttemptRound = 0;
     QString              lastCompletedUserId;

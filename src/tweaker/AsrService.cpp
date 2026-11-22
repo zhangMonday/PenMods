@@ -6,6 +6,7 @@
 
 #include "tweaker/AsrService.h"
 
+#include "base/YEnum.h"
 #include "base/YPointer.h"
 
 #include "common/Event.h"
@@ -39,6 +40,14 @@ constexpr int kPageChangeGraceMs = 1000;
 
 constexpr int kDefaultTimeoutMs   = 20000;
 constexpr int kDefaultMaxRecordMs = 45000;
+
+/// 打开麦克风推迟这么久（约两帧）：QAudioInput 要枚举 ALSA 设备、申请音频引用并执行 amixer，
+/// 这一段几百毫秒压在按键的槽函数里就是"键盘语音按钮点击很卡"。先让 QML 把麦克风图标/聆听态
+/// 画出来，再干活；录音本身是"听到人声才开始计"的，晚 30 ms 不会丢内容。
+constexpr int kCaptureStartDelayMs = 30;
+/// 补开语音助手页之前的等待：原厂页面通常由厂商自己的调用链打开，给它一点时间自己出现，
+/// 免得我们重复 showSpeechPage（页面若已显示，YSpeechPage 会调 markVendorSpeechPageVisible）。
+constexpr int kVendorPageFallbackMs = 250;
 
 /// 一个 hook 的目标地址与原始函数指针（`origin` 由 Dobby 填）。
 struct VoiceHook {
@@ -94,6 +103,9 @@ AsrService::AsrService() : Logger("AsrService") {
         // 先注入再复位状态：QML 的 acceptVoiceResult() 要求"语音输入仍在进行"才收下文本。
         _injectResult(manager, text);
         _setVoiceState(VoiceState::Idle, QStringLiteral("识别完成"));
+        // 语音助手页：把厂商 recognizing 推回 idle，页面按原厂逻辑收尾（文本已注入，
+        // 开着"语音助手"时 YSpeechPage 会把结果转给聊天页并离开）。
+        _resetVendorRecognizing(manager);
     });
 
     connect(mVoiceClient, &DeepSeekAsr::failed, this, [this](const QString& reason) {
@@ -103,6 +115,7 @@ AsrService::AsrService() : Logger("AsrService") {
         _setVoiceState(VoiceState::Idle, reason);
         // 录制之后失败：用户那句话已经说完了，没法重放给厂商，只能讲清原因让他重来。
         _toast(QStringLiteral("DeepSeek 语音识别失败：") + reason);
+        if (mSessionVendorOwned) _resetVendorRecognizing(manager);
         if (manager) _scheduleStateRecovery(manager);
     });
 
@@ -117,6 +130,9 @@ AsrService::AsrService() : Logger("AsrService") {
     connect(&Event::getInstance(), &Event::beforeUiInitialization, this, [this](QQuickView&, QQmlContext* context) {
         mRootContext = context;
         context->setContextProperty("asrService", this);
+        // 设备/格式探测（ALSA 枚举 + 格式协商）预先做掉，别等用户按语音键时才付这笔开销。
+        // 必须等事件循环转起来：Qt 的音频插件在这之前还不可用。
+        if (mEnabled) QTimer::singleShot(1500, this, []() { AsrCapture::warmUp(); });
     });
 
     // 只在开启时装 hook：默认关闭时 DobbyHook 一次都不会被调用，行为与没有这个功能完全一致。
@@ -170,6 +186,8 @@ void AsrService::setEnabled(bool value) {
 
     if (mEnabled) {
         _installHooks();
+        // 刚打开：UI 已经起来的话立刻预热（没起来的路径由构造函数里的延迟预热兜住）。
+        if (mRootContext) QTimer::singleShot(0, this, []() { AsrCapture::warmUp(); });
     } else {
         if (mVoiceState != VoiceState::Idle) _abortSession(QStringLiteral("已关闭 DeepSeek 语音识别"));
         _removeHooks();
@@ -268,9 +286,9 @@ QString AsrService::apiKeyHint() const {
     const auto where = source == QLatin1String("asr")    ? QStringLiteral("本页")
                      : source == QLatin1String("search") ? QStringLiteral("联网搜索")
                                                          : QStringLiteral("当前模型");
-    const auto key   = _apiKeyFrom(source);
-    if (key.size() <= 8) return QStringLiteral("已配置（来自%1）").arg(where);
-    return QStringLiteral("已配置（来自%1，…%2）").arg(where, key.right(4));
+    // 只说到"已配置 + 来自哪里"，不回显 Key 的任何片段：设置页是公共可见的界面，
+    // 后 4 位对排错没有帮助，反而让肩窥就能拿到一半以上的信息（真机反馈要求去掉）。
+    return QStringLiteral("已配置（来自%1）").arg(where);
 }
 
 // ───────────────────────── 接管：会话 ─────────────────────────
@@ -283,7 +301,8 @@ bool AsrService::_mayTakeOver(QString& reason) const {
         return false;
     }
     if (!mEnabled) return false;                                                // 关闭：静默走厂商路径，不打扰用户
-    if (mVoiceState != VoiceState::Idle || mCapture->capturing()) return false; // 已在会话中：忽略重复启动
+    if (mVoiceState != VoiceState::Idle || mCaptureStarting || mCapture->capturing())
+        return false; // 已在会话中（或正在打开麦克风）：忽略重复启动
     if (!hasApiKey()) {
         reason = QStringLiteral("未配置 DeepSeek API Key，已使用有道语音");
         return false;
@@ -314,21 +333,86 @@ bool AsrService::_startSession(QObject* speechManager, bool vendorOwned, QString
         return false;
     }
 
-    QString captureError;
-    if (!mCapture->start(captureError)) {
-        reason = captureError;
-        return false;
-    }
-
+    // 状态先发出去、麦克风下一拍再开（原因见 kCaptureStartDelayMs）：QML 立刻把语音图标
+    // 切成"聆听中"，按键反馈不再被 ALSA 初始化卡住。
     mSessionManager     = manager;
     mSessionVendorOwned = vendorOwned;
     mPendingManager.clear();
     mCapture->setSilenceAutoStop(vendorOwned);
     mSessionClock.start();
     mSessionDeadline.start(mMaxRecordMs);
+    mCaptureStarting = true;
+    const int startSeq = ++mCaptureStartSeq;
     _setVoiceState(VoiceState::Listening, QStringLiteral("正在聆听…"));
+    QTimer::singleShot(kCaptureStartDelayMs, this, [this, startSeq]() { _openCapture(startSeq); });
+
+    // 语音助手页：厂商的 startAsrRecord 被我们吞掉了，而那一页正是在它的调用链里打开的
+    // （KeyBoard 里 showSpeechPage 的 hook 就是为键盘路径挡掉这一次打开）。接管只替换识别
+    // 链路，界面/动画必须照旧，所以这里补开；先给原厂链路 kVendorPageFallbackMs 自己出现的机会。
+    if (vendorOwned) {
+        mVendorPageSeen = false;
+        const int pageWait = ++mVendorPageWaitSeq;
+        QTimer::singleShot(kVendorPageFallbackMs, this, [this, pageWait]() {
+            if (pageWait != mVendorPageWaitSeq || mVendorPageSeen || mVoiceState == VoiceState::Idle) return;
+            _showVendorSpeechPage();
+        });
+    }
+
     info("DeepSeek 语音接管开始（{}，上限 {} ms）", vendorOwned ? "语音助手页" : "键盘语音键", mMaxRecordMs);
     return true;
+}
+
+void AsrService::_openCapture(int startSeq) {
+    if (startSeq != mCaptureStartSeq || !mCaptureStarting) return;
+    mCaptureStarting = false;
+    if (mVoiceState == VoiceState::Idle) return; // 期间被取消/关闭
+
+    QString captureError;
+    if (!mCapture->start(captureError)) {
+        // 这里是"设备真的没有可用的麦克风 / 格式不支持"这类失败（录音机占用、无 Key 等
+        // 前置条件在 _mayTakeOver 里已经同步判掉并回落厂商了）。麦克风推迟打开意味着这一刻
+        // 已经错过了那条同步回落路径，所以只弹原因、把界面复位，让用户重按 —— 设备层面
+        // 打不开时厂商路径同样打不开。
+        warn("语音接管：麦克风打开失败（{}）", captureError.toStdString());
+        _toast(captureError);
+        QObject* manager = mSessionManager.data();
+        mSessionManager.clear();
+        mSessionDeadline.stop();
+        mCapture->setSilenceAutoStop(false);
+        if (mSessionVendorOwned) _resetVendorRecognizing(manager);
+        _setVoiceState(VoiceState::Idle, captureError);
+        return;
+    }
+
+    // 语音助手页的聆听动画跟的是厂商状态机（我们没走它的录音，它永远停在 idle），
+    // 这里推到 AsrBegin 让页面/动画与原厂一致；结束时再推回 AsrIdle。
+    if (mSessionVendorOwned) _pushRecognizing(mSessionManager.data(), static_cast<int>(ASRState::AsrBegin));
+}
+
+void AsrService::_showVendorSpeechPage() {
+    auto* global = YPointer<YGlobal>::getInstance();
+    auto* showSpeechPage = PEN_SYM("_ZN7YGlobal14showSpeechPageEv");
+    if (!global || !showSpeechPage) {
+        warn("找不到 YGlobal::showSpeechPage，接管期间无法自动打开语音助手页");
+        return;
+    }
+    try {
+        info("接管期间补开原厂语音助手页");
+        reinterpret_cast<uint64 (*)(void*)>(showSpeechPage)(global);
+    } catch (...) {
+        warn("打开语音助手页失败");
+    }
+}
+
+void AsrService::markVendorSpeechPageVisible() {
+    // 页面自己出现了（原厂链路或我们补开都会走到这里）：后续的补开计划作废。
+    mVendorPageSeen    = true;
+    mVendorPageWaitSeq = 0;
+}
+
+void AsrService::_resetVendorRecognizing(QObject* manager) {
+    if (!manager || !mSessionVendorOwned) return;
+    _pushRecognizing(manager, static_cast<int>(ASRState::AsrIdle));
 }
 
 bool AsrService::beginVoiceCapture(QObject* speechManager) {
@@ -378,6 +462,19 @@ void AsrService::cancelVoiceCapture() {
 
 void AsrService::_finishSession() {
     if (mVoiceState != VoiceState::Listening) return;
+    // 麦克风还没真正打开（用户点得太快）：这次只是取消，不算"没有录到声音"。
+    if (mCaptureStarting) {
+        mCaptureStartSeq++; // 作废 _openCapture 的那次调度
+        mCaptureStarting = false;
+        info("语音接管：麦克风尚未打开就被取消");
+        QObject* target = mSessionManager.data();
+        mSessionManager.clear();
+        mSessionDeadline.stop();
+        mCapture->setSilenceAutoStop(false);
+        if (mSessionVendorOwned) _resetVendorRecognizing(target);
+        _setVoiceState(VoiceState::Idle, QStringLiteral("已取消"));
+        return;
+    }
     mSessionDeadline.stop();
     mCapture->setSilenceAutoStop(false);
 
@@ -390,6 +487,7 @@ void AsrService::_finishSession() {
         warn("语音接管结束：没有录到声音");
         _setVoiceState(VoiceState::Idle, QStringLiteral("没有录到声音"));
         _toast(QStringLiteral("没有录到声音，请重试"));
+        if (mSessionVendorOwned) _resetVendorRecognizing(target);
         if (target) _scheduleStateRecovery(target);
         return;
     }
@@ -410,10 +508,17 @@ void AsrService::_finishSession() {
 }
 
 void AsrService::_abortSession(const QString& reason) {
+    if (mCaptureStarting) {
+        mCaptureStartSeq++;
+        mCaptureStarting = false;
+    }
     mSessionDeadline.stop();
     mCapture->setSilenceAutoStop(false);
     mVoiceClient->cancel();
     mCapture->abort();
+    // 取消也要把厂商状态机退回去：语音助手页的聆听动画跟的是 speechManager.recognizing，
+    // 我们推到 AsrBegin 过的必须推回来，否则麦克风图标会一直亮着。
+    _resetVendorRecognizing(mSessionManager.data());
     mSessionManager.clear();
     mPendingManager.clear();
     _setVoiceState(VoiceState::Idle, reason);

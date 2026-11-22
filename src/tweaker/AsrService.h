@@ -45,7 +45,7 @@ class DeepSeekAsr;
 class AsrService : public QObject, public Singleton<AsrService>, private Logger {
     Q_OBJECT
 
-    // ───────────── 需求 10：语言识别服务设定 ─────────────
+    // ───────────── 需求 10：语音识别服务设定 ─────────────
     Q_PROPERTY(bool enabled READ enabled WRITE setEnabled NOTIFY settingsChanged)
     /// 当前选择的语音服务："system"（默认有道语音）/ "deepseek"（映射到 enabled）
     Q_PROPERTY(QString provider READ provider NOTIFY settingsChanged)
@@ -90,6 +90,10 @@ public:
     bool endVoiceCapture(QObject* speechManager);
     /// 放弃当前会话（离开输入页/语音页时用）：不录音、不上传、直接把麦克风还给系统。
     Q_INVOKABLE void cancelVoiceCapture();
+    /// 语音助手页已经显示出来了（由 YSpeechPage.qml 的 onVisibleChanged 调用）。
+    /// 接管期间是我们而不是厂商的 startAsrRecord 打开了那一页，所以要先知道它有没有自己出现，
+    /// 避免重复打开（见 _showVendorSpeechPage）。
+    Q_INVOKABLE void markVendorSpeechPageVisible();
 
     /// 语音助手页 / 长按语音的接管入口。
     ///
@@ -142,6 +146,12 @@ private:
     // ── 接管（需求 10） ──
     bool     _mayTakeOver(QString& reason) const;
     bool     _startSession(QObject* speechManager, bool vendorOwned, QString& reason);
+    /// 真正打开麦克风（由 _startSession 推迟一拍调用，见那里的注释）。
+    void     _openCapture(int startSeq);
+    /// 补开原厂语音助手页（我们在厂商 startAsrRecord 里就接管了，页面不会自己出现）。
+    void     _showVendorSpeechPage();
+    /// 把厂商的 recognizing 推回 idle（接管期间它没有走过正常状态机）。
+    void     _resetVendorRecognizing(QObject* manager);
     void     _finishSession();
     void     _abortSession(const QString& reason);
     void     _setVoiceState(VoiceState state, const QString& status);
@@ -164,6 +174,8 @@ private:
 
     // ── 音频转文字（需求 11） ──
     void                     _transcribeBegin(const QString& path);
+    /// 定位设备上的 mpv（转码器）。找不到返回空串，并把试过的路径按顺序追加到 `tried`。
+    QString                  transcodeExecutable(QStringList& tried);
     void                     _transcribeFail(const QString& reason);
     void                     _transcribeCleanup();
     void                     _transcribeDirect(const QString& path);
@@ -198,6 +210,13 @@ private:
     QPointer<QObject> mPendingManager; ///< 已停止采集、等识别结果的注入目标
     QTimer            mSessionDeadline;
     QElapsedTimer     mSessionClock;
+    /// 麦克风正在异步打开（_startSession 发出的单拍延迟还没到）。这段时间里状态已经是
+    /// Listening，但 mCapture 还没开始采，停止时必须先取消这次打开。
+    bool mCaptureStarting{false};
+    int  mCaptureStartSeq{0};
+    /// 语音助手页是否已经由页面自己显示过（避免重复 showSpeechPage）。
+    bool mVendorPageSeen{false};
+    int  mVendorPageWaitSeq{0};
     VoiceState        mVoiceState{VoiceState::Idle};
     bool              mSessionVendorOwned{false};
     bool              mRecognizingProbed{false};
@@ -218,6 +237,7 @@ private:
     int                mSegmentRate{16000};
     int                mSegmentChannels{1};
     QPointer<QProcess> mTranscode;
+    QString            mMpvExecutable; ///< 上次探测到的 mpv 路径（只缓存命中结果）
     QTimer             mTranscodeDeadline;
     QString            mTranscodeTemp; ///< mpv 转码输出（临时文件）
     QString            mTranscribeTarget;
