@@ -69,18 +69,25 @@ void AntiEmbs::onUiCompleted() {
     // 两个入口都要写：YSettingManager::setSpkVolume 的缓存值已经等于目标值时会提前
     // 返回，真正下发到混音器的是 YDeviceManager::setSpkVolume（与
     // VolumeGuard::enforce() 的处理方式一致）。写 0 不需要延迟重试。
+    // 三个厂商符号都先判空再调：PEN_CALL 是裸函数指针强转，符号缺失时等于跳转到 0。
+    // 这里在 uiCompleted（Qt 槽）里执行，一次空指针调用就是一次 SIGSEGV -> 守护器重启 ->
+    // 连续快速失败会把设备推进 recovery，代价远大于"静音功能不生效"。
     if (mBootMute) {
         auto* setting = YPointer<YSettingManager>::getInstance();
-        if (setting != nullptr) {
-            PEN_CALL(void, "_ZN15YSettingManager12setSpkVolumeEi", void*, int)(setting, 0);
-            auto* device = PEN_CALL(void*, "_ZN10YSingletonI14YDeviceManagerE8instanceEv")();
-            if (device != nullptr) {
-                PEN_CALL(void, "_ZN14YDeviceManager12setSpkVolumeEi", void*, int)(device, 0);
-            }
-            spdlog::info("AntiEmbs: 开机默认静音已应用（音量=0）");
-        } else {
-            spdlog::warn("AntiEmbs: 开机默认静音跳过，YSettingManager 尚未就绪");
+        auto* setVolumeSym = PEN_SYM("_ZN15YSettingManager12setSpkVolumeEi");
+        if (setting == nullptr || setVolumeSym == nullptr) {
+            spdlog::warn("AntiEmbs: 开机默认静音跳过（YSettingManager 或 setSpkVolume 不可用）");
+            return;
         }
+        reinterpret_cast<void (*)(void*, int)>(setVolumeSym)(setting, 0);
+
+        auto* instanceSym = PEN_SYM("_ZN10YSingletonI14YDeviceManagerE8instanceEv");
+        auto* deviceSym   = PEN_SYM("_ZN14YDeviceManager12setSpkVolumeEi");
+        if (instanceSym != nullptr && deviceSym != nullptr) {
+            auto* device = reinterpret_cast<void* (*)()>(instanceSym)();
+            if (device != nullptr) reinterpret_cast<void (*)(void*, int)>(deviceSym)(device, 0);
+        }
+        spdlog::info("AntiEmbs: 开机默认静音已应用（音量=0）");
     }
 }
 
