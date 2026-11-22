@@ -1,0 +1,251 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
+#include "tweaker/AsrCapture.h"
+
+#include "base/YPointer.h"
+
+#include "common/Utils.h"
+
+#include "system/sound/AudioDaemon.h"
+
+#include "recorder/AudioRecorder.h"
+
+#include "tweaker/AsrWav.h"
+
+#include <QAudioDeviceInfo>
+#include <QAudioInput>
+
+namespace mod {
+
+namespace {
+
+constexpr int kSampleRate = 16000;
+constexpr int kSampleSize = 16;
+/// 接口上限 120 秒；留 5 秒余量给重传/编码，避免"刚好 120.0 秒"被服务端判超限。
+constexpr int  kMaxCaptureMs  = 115 * 1000;
+constexpr auto kMicOnCommand  = "amixer cset numid=2 1";
+constexpr auto kMicOffCommand = "amixer cset numid=2 0";
+
+/// `mod::exec()` 用 popen，理论上可能抛异常；这些命令必须在任何路径上都"只看结果不看异常"，
+/// 否则一个 popen 失败会从 Qt 的定时器/信号回调里穿出去把进程带走。
+void runCommand(const char* command) {
+    try {
+        exec(command);
+    } catch (...) {
+        spdlog::warn("执行命令失败：{}", command);
+    }
+}
+
+/// 静音判定：int16 满量程 32767，这里取 300 左右的峰值当作"没人说话"。
+/// 设备麦克风增益未知，所以阈值保守 + 需要的静音时间长（2 秒）—— 判早了会截断用户的话，
+/// 判晚了只是多等一会儿，两种错误的代价不对称。
+constexpr int kSilencePeak       = 300;
+constexpr int kSilenceAfterMs    = 2000;
+constexpr int kSilenceMinTotalMs = 1200;
+
+} // namespace
+
+int AsrCapture::maxCaptureMs() { return kMaxCaptureMs; }
+
+AsrCapture::AsrCapture(QObject* parent) : QObject(parent) { mError = QStringLiteral("麦克风未启动"); }
+
+AsrCapture::~AsrCapture() { abort(); }
+
+bool AsrCapture::start(QString& reason) {
+    if (mInputAudio) {
+        reason = QStringLiteral("语音识别正在录音");
+        return false;
+    }
+
+    // 与 PenMods 录音机互斥：同一时刻只能有一个进程内采集器打开 ALSA 捕获设备。
+    if (AudioRecorder::getInstance().isWorking()) {
+        reason = QStringLiteral("录音机正在录音，语音识别暂不可用");
+        return false;
+    }
+
+    const auto device = QAudioDeviceInfo::defaultInputDevice();
+    if (device.isNull() || device.deviceName().isEmpty()) {
+        reason = QStringLiteral("没有可用的麦克风");
+        return false;
+    }
+
+    QAudioFormat format;
+    format.setSampleRate(kSampleRate);
+    format.setSampleSize(kSampleSize);
+    format.setSampleType(QAudioFormat::SignedInt);
+    format.setByteOrder(QAudioFormat::LittleEndian);
+    format.setCodec(QStringLiteral("audio/pcm"));
+#if PL_BUILD_YDP02X
+    // YDP02X 的默认采集格式是双声道（见 AudioRecorder）；这里照抄，取出后再取左声道。
+    format.setChannelCount(2);
+#else
+    format.setChannelCount(1);
+#endif
+
+    if (!device.isFormatSupported(format)) {
+        const auto nearest = device.nearestFormat(format);
+        // 只接受"16-bit 有符号小端"，其它位深（24/32-bit、浮点）不做重采样：宁可清楚失败
+        if (nearest.sampleSize() != kSampleSize || nearest.sampleType() != QAudioFormat::SignedInt
+            || nearest.byteOrder() != QAudioFormat::LittleEndian) {
+            reason = QStringLiteral("麦克风不支持 16-bit PCM 采集");
+            return false;
+        }
+        format = nearest;
+    }
+
+    mSampleRate = format.sampleRate();
+    mChannels   = qMax(1, format.channelCount());
+    mPcm.clear();
+    mLimitReached   = false;
+    mSilenceEmitted = false;
+    mHeardSpeech    = false;
+    mSilentMs       = 0;
+    mTotalMs        = 0;
+    mError.clear();
+
+    // 麦克风竞争：厂商唯一已知可行的顺序（forceStop → amixer on → AudioDaemon 引用）
+    mDaemonHeld = true;
+    AudioDaemon::getInstance().acquire(AudioSource::SYSTEM);
+    if (auto* soundCenter = YPointer<YSoundCenter>::getInstance())
+        PEN_CALL(void, "_ZN12YSoundCenter9forceStopEv", void*)(soundCenter);
+    runCommand(kMicOnCommand);
+    mMixerEnabled = true;
+
+    mInputAudio = new QAudioInput(device, format, this);
+    // 单次请求最多 120 秒的 16-bit 数据；按实际采集格式再留一倍余量，超出的部分直接丢弃。
+    mMaxBytes = static_cast<int>(static_cast<qint64>(kMaxCaptureMs) * mSampleRate / 1000 * mChannels * 2);
+    mInputAudio->setBufferSize(1024 * 1024);
+    mInputAudio->setVolume(1.0);
+    mInputDevice = mInputAudio->start();
+    if (!mInputDevice) {
+        mError = QStringLiteral("无法打开麦克风");
+        reason = mError;
+        _release();
+        return false;
+    }
+
+    if (mInputAudio->error() != QAudio::NoError) {
+        mError = QStringLiteral("打开输入设备时出错");
+        reason = mError;
+        _release();
+        return false;
+    }
+
+    connect(mInputDevice, &QIODevice::readyRead, this, [this]() {
+        if (!mInputDevice) return;
+        const auto chunk = mInputDevice->readAll();
+        if (chunk.isEmpty()) return;
+        const int room = mMaxBytes - mPcm.size();
+        if (room <= 0) {
+            _applyLimit();
+            return;
+        }
+        const QByteArray kept = chunk.left(room);
+        mPcm.append(kept);
+        _analyseSilence(kept);
+        if (mPcm.size() >= mMaxBytes) _applyLimit();
+    });
+
+    return true;
+}
+
+void AsrCapture::_applyLimit() {
+    if (mLimitReached) return;
+    mLimitReached = true;
+    emit limitReached();
+}
+
+QByteArray AsrCapture::stop() {
+    if (!mInputAudio) return {};
+    // 先读干缓冲，避免丢掉最后几百毫秒
+    if (mInputDevice) {
+        const auto tail = mInputDevice->readAll();
+        if (!tail.isEmpty()) {
+            const int room = mMaxBytes - mPcm.size();
+            if (room > 0) mPcm.append(tail.left(room));
+        }
+    }
+    const QByteArray raw      = mPcm;
+    const int        channels = mChannels;
+    _release();
+    // ASR 只识别左声道；双声道源取 ch0 并重写为单声道 WAV。
+    return asr::extractChannel(raw, channels, 0);
+}
+
+void AsrCapture::abort() {
+    if (!mInputAudio) {
+        mPcm.clear();
+        return;
+    }
+    _release();
+}
+
+void AsrCapture::_release() {
+    if (mInputAudio) {
+        mInputAudio->stop();
+        mInputAudio->disconnect(this);
+        mInputAudio->deleteLater();
+        mInputAudio = nullptr;
+    }
+    mInputDevice = nullptr;
+    mPcm.clear();
+
+    if (mMixerEnabled) {
+        runCommand(kMicOffCommand);
+        mMixerEnabled = false;
+    }
+    if (mDaemonHeld) {
+        AudioDaemon::getInstance().release(AudioSource::SYSTEM);
+        mDaemonHeld = false;
+    }
+}
+
+void AsrCapture::setSilenceAutoStop(bool enabled) {
+    mSilenceEnabled = enabled;
+    mSilenceEmitted = false;
+    mHeardSpeech    = false;
+    mSilentMs       = 0;
+}
+
+void AsrCapture::_analyseSilence(const QByteArray& chunk) {
+    if (!mSilenceEnabled || mSilenceEmitted || chunk.isEmpty()) return;
+    const qint64 bytesPerMs = static_cast<qint64>(mSampleRate) * mChannels * 2 / 1000;
+    if (bytesPerMs <= 0) return;
+
+    const auto* data  = reinterpret_cast<const uchar*>(chunk.constData());
+    const int   count = static_cast<int>(chunk.size() / 2);
+    int         peak  = 0;
+    for (int i = 0; i < count; ++i) {
+        // 按字节拼出 int16（小端），避免依赖 QByteArray 的对齐
+        const auto sample    = static_cast<qint16>(static_cast<quint16>(data[i * 2] | (data[i * 2 + 1] << 8)));
+        const int  magnitude = sample < 0 ? -static_cast<int>(sample) : static_cast<int>(sample);
+        if (magnitude > peak) peak = magnitude;
+    }
+
+    const int chunkMs  = static_cast<int>(chunk.size() / bytesPerMs);
+    mTotalMs          += chunkMs;
+    if (peak >= kSilencePeak) {
+        mHeardSpeech = true;
+        mSilentMs    = 0;
+        return;
+    }
+    if (!mHeardSpeech) return; // 还没听到人声，不做静音收尾（避免一开始就误判）
+    mSilentMs += chunkMs;
+    if (mTotalMs >= kSilenceMinTotalMs && mSilentMs >= kSilenceAfterMs) {
+        mSilenceEmitted = true;
+        emit silenceDetected();
+    }
+}
+
+int AsrCapture::recordedMs() const {
+    // 仅用于日志/兜底判断，用当前累积的数据量估算，不依赖 QElapsedTimer。
+    const qint64 bytesPerSecond = static_cast<qint64>(mSampleRate) * mChannels * 2;
+    if (bytesPerSecond <= 0) return 0;
+    return static_cast<int>(mPcm.size() * 1000 / bytesPerSecond);
+}
+
+} // namespace mod

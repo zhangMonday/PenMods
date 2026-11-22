@@ -1,0 +1,634 @@
+// SPDX-License-Identifier: GPL-3.0-only
+/*
+ * Copyright (C) 2022-present, PenUniverse.
+ * This file is part of the PenMods open source project.
+ */
+
+#include "tweaker/AsrService.h"
+
+#include "base/YPointer.h"
+
+#include "common/Event.h"
+#include "common/Utils.h"
+
+#include "tweaker/AsrCapture.h"
+#include "tweaker/AsrWav.h"
+#include "tweaker/DeepSeekAsr.h"
+
+#include <QQmlContext>
+#include <QQuickView>
+#include <QThread>
+
+namespace mod {
+
+namespace {
+
+// 厂商符号 —— 全部来自 `KeyBoard.cpp` / `AudioRecorder.cpp` 里已经在用的那几个。
+constexpr auto kSetAsrResult   = "_ZN14YSpeechManager12setAsrResultERK7QString";
+constexpr auto kStartAsrRecord = "_ZN14YSpeechManager14startAsrRecordEv";
+constexpr auto kStopAsrRecord  = "_ZN14YSpeechManager13stopAsrRecordEv";
+
+/// 注入文本之后，厂商 `recognizing` 状态如果还没回到 idle，等这么久再兜底收尾。
+/// 为什么要兜底：接管期间厂商从来没有真正开始录音，它的状态机完全没前进过；如果哪个版本里
+/// `setAsrResult` 自己也不推进状态，键盘麦克风图标和语音页的"正在聆听"就会一直亮着。
+/// 兜底只做"能确认还卡着"时才动手（读不到状态就什么都不做，避免误调厂商 stop 把正常流程打断）。
+constexpr int kStateRecoveryDelayMs = 1200;
+
+/// 语音助手页的页索引变化：打开该页本身也会改变页索引，所以给会话开始后的头 1 秒一个宽限期。
+constexpr int kPageChangeGraceMs = 1000;
+
+constexpr int kDefaultTimeoutMs   = 20000;
+constexpr int kDefaultMaxRecordMs = 45000;
+
+/// 一个 hook 的目标地址与原始函数指针（`origin` 由 Dobby 填）。
+struct VoiceHook {
+    const char* symbol;
+    void*       target{nullptr};
+    void*       origin{nullptr};
+    bool        active{false};
+};
+
+// 只包含 POD（指针/布尔），常量初始化，可以安全地在 BeforeMain 之前存在。
+VoiceHook g_startAsrRecordHook{kStartAsrRecord};
+VoiceHook g_stopAsrRecordHook{kStopAsrRecord};
+
+} // namespace
+
+AsrService::AsrService() : Logger("AsrService") {
+    _load();
+
+    mCapture     = new AsrCapture(this);
+    mVoiceClient = new DeepSeekAsr(this);
+    mFileClient  = new DeepSeekAsr(this);
+
+    mSessionDeadline.setSingleShot(true);
+    connect(&mSessionDeadline, &QTimer::timeout, this, [this]() {
+        if (mVoiceState == VoiceState::Idle) return;
+        info("语音会话达到 {} ms 上限，自动收尾", mMaxRecordMs);
+        _finishSession();
+    });
+
+    // 采集长度已达接口上限：必须收尾，否则麦克风一直被占着（120 秒是 DeepSeek 的硬上限）
+    connect(mCapture, &AsrCapture::limitReached, this, [this]() {
+        if (mVoiceState != VoiceState::Listening) return;
+        info("录音达到单次请求上限，自动收尾");
+        _finishSession();
+    });
+
+    // 语音助手页没有我们能挂钩的停止按钮：靠"听到人声之后安静 2 秒"收尾
+    connect(mCapture, &AsrCapture::silenceDetected, this, [this]() {
+        if (mVoiceState != VoiceState::Listening || !mSessionVendorOwned) return;
+        info("检测到静音，结束语音助手会话");
+        _finishSession();
+    });
+
+    connect(mVoiceClient, &DeepSeekAsr::succeeded, this, [this](const QString& text, int durationMs) {
+        QObject* manager = mPendingManager.data();
+        mPendingManager.clear();
+        info("DeepSeek 语音识别成功：{} 字 / {} ms", text.size(), durationMs);
+        if (!manager) {
+            warn("识别成功但注入目标已失效，结果被丢弃");
+            _setVoiceState(VoiceState::Idle, QStringLiteral("识别完成"));
+            return;
+        }
+        // 先注入再复位状态：QML 的 acceptVoiceResult() 要求"语音输入仍在进行"才收下文本。
+        _injectResult(manager, text);
+        _setVoiceState(VoiceState::Idle, QStringLiteral("识别完成"));
+    });
+
+    connect(mVoiceClient, &DeepSeekAsr::failed, this, [this](const QString& reason) {
+        QObject* manager = mPendingManager.data();
+        mPendingManager.clear();
+        warn("DeepSeek 语音识别失败：{}", reason.toStdString());
+        _setVoiceState(VoiceState::Idle, reason);
+        // 录制之后失败：用户那句话已经说完了，没法重放给厂商，只能讲清原因让他重来。
+        _toast(QStringLiteral("DeepSeek 语音识别失败：") + reason);
+        if (manager) _scheduleStateRecovery(manager);
+    });
+
+    // 换页 = 用户离开了语音助手页（那一页没有我们能碰的"停止录音"接口）
+    connect(&Event::getInstance(), &Event::currentPageIndexChanged, this, [this](int) {
+        if (mVoiceState != VoiceState::Listening || !mSessionVendorOwned) return;
+        if (mSessionClock.elapsed() < kPageChangeGraceMs) return;
+        info("页面已切换，结束语音助手会话");
+        _finishSession();
+    });
+
+    connect(&Event::getInstance(), &Event::beforeUiInitialization, this, [this](QQuickView&, QQmlContext* context) {
+        mRootContext = context;
+        context->setContextProperty("asrService", this);
+    });
+
+    // 只在开启时装 hook：默认关闭时 DobbyHook 一次都不会被调用，行为与没有这个功能完全一致。
+    if (mEnabled) _installHooks();
+}
+
+// ───────────────────────── 配置 ─────────────────────────
+
+json AsrService::_readSection() const {
+    const auto ai = Config::getInstance().read("ai");
+    if (!ai.is_object()) return json::object();
+    const auto it = ai.find("asr");
+    return it != ai.end() && it->is_object() ? *it : json::object();
+}
+
+void AsrService::_saveSection() {
+    auto ai = Config::getInstance().read("ai");
+    if (!ai.is_object()) ai = json::object();
+    ai["asr"] = mCfg;
+    Config::getInstance().write("ai", ai, true);
+}
+
+void AsrService::_load() {
+    mCfg = _readSection();
+
+    const auto enabled = mCfg.find("enabled");
+    mEnabled           = enabled != mCfg.end() && enabled->is_boolean() && enabled->get<bool>();
+
+    const auto timeout = mCfg.find("timeout_ms");
+    mTimeoutMs = timeout != mCfg.end() && timeout->is_number_integer() ? std::clamp(timeout->get<int>(), 3000, 120000)
+                                                                       : kDefaultTimeoutMs;
+
+    const auto maxRecord = mCfg.find("max_record_ms");
+    mMaxRecordMs         = maxRecord != mCfg.end() && maxRecord->is_number_integer()
+                             ? std::clamp(maxRecord->get<int>(), 5000, AsrCapture::maxCaptureMs())
+                             : kDefaultMaxRecordMs;
+
+    // 保证这一段始终是完整形状，设置页与后续写入都不用再判空
+    mCfg["enabled"]       = mEnabled;
+    mCfg["timeout_ms"]    = mTimeoutMs;
+    mCfg["max_record_ms"] = mMaxRecordMs;
+    if (!mCfg.contains("model")) mCfg["model"] = "deepseek-asr";
+    if (!mCfg.contains("deepseek_api_key")) mCfg["deepseek_api_key"] = "";
+}
+
+void AsrService::setEnabled(bool value) {
+    if (mEnabled == value) return;
+    mEnabled        = value;
+    mCfg["enabled"] = value;
+    _saveSection();
+
+    if (mEnabled) {
+        _installHooks();
+    } else {
+        if (mVoiceState != VoiceState::Idle) _abortSession(QStringLiteral("已关闭 DeepSeek 语音识别"));
+        _removeHooks();
+    }
+    info("DeepSeek 语音识别接管：{}", value ? "开启" : "关闭");
+    emit settingsChanged();
+}
+
+void AsrService::setTimeoutMs(int value) {
+    value = std::clamp(value, 3000, 120000);
+    if (mTimeoutMs == value) return;
+    mTimeoutMs         = value;
+    mCfg["timeout_ms"] = value;
+    _saveSection();
+    emit settingsChanged();
+}
+
+void AsrService::selectProvider(const QString& provider) {
+    setEnabled(provider.compare(QStringLiteral("deepseek"), Qt::CaseInsensitive) == 0);
+}
+
+void AsrService::setApiKey(const QString& key) {
+    const auto trimmed = key.trimmed();
+    if (_trimmed(mCfg, "deepseek_api_key") == trimmed) return;
+    mCfg["deepseek_api_key"] = trimmed.toStdString();
+    _saveSection();
+    info("DeepSeek API Key 已更新（{} 字符）", trimmed.size()); // 只记长度，不记内容
+    emit settingsChanged();
+}
+
+void AsrService::clearApiKey() { setApiKey(QString()); }
+
+// ───────────────────────── API Key 解析链 ─────────────────────────
+
+QString AsrService::_trimmed(const json& object, const char* key) {
+    if (!object.is_object()) return {};
+    const auto it = object.find(key);
+    if (it == object.end() || !it->is_string()) return {};
+    return QString::fromStdString(it->get<std::string>()).trimmed();
+}
+
+QString AsrService::apiKeySource() const {
+    if (!_trimmed(mCfg, "deepseek_api_key").isEmpty()) return QStringLiteral("asr");
+
+    const auto ai = Config::getInstance().read("ai");
+    if (!ai.is_object()) return {};
+
+    const auto search = ai.find("search");
+    if (search != ai.end() && search->is_object() && !_trimmed(*search, "deepseek_api_key").isEmpty())
+        return QStringLiteral("search");
+
+    const auto activeId = _trimmed(ai, "activeModelId");
+    const auto models   = ai.find("models");
+    if (activeId.isEmpty() || models == ai.end() || !models->is_array()) return {};
+    for (const auto& model : *models) {
+        if (!model.is_object() || _trimmed(model, "id") != activeId) continue;
+        // 只有明确指向 DeepSeek 官方端点的模型，它的 key 才能拿来调 ASR
+        if (!_trimmed(model, "endpoint").contains(QStringLiteral("api.deepseek.com"))) return {};
+        if (_trimmed(model, "apiKey").isEmpty()) return {};
+        return QStringLiteral("model");
+    }
+    return {};
+}
+
+QString AsrService::_apiKeyFrom(const QString& source) const {
+    if (source == QLatin1String("asr")) return _trimmed(mCfg, "deepseek_api_key");
+
+    const auto ai = Config::getInstance().read("ai");
+    if (!ai.is_object()) return {};
+
+    if (source == QLatin1String("search")) {
+        const auto it = ai.find("search");
+        return it != ai.end() && it->is_object() ? _trimmed(*it, "deepseek_api_key") : QString();
+    }
+    if (source == QLatin1String("model")) {
+        const auto activeId = _trimmed(ai, "activeModelId");
+        const auto models   = ai.find("models");
+        if (activeId.isEmpty() || models == ai.end() || !models->is_array()) return {};
+        for (const auto& model : *models) {
+            if (!model.is_object() || _trimmed(model, "id") != activeId) continue;
+            if (!_trimmed(model, "endpoint").contains(QStringLiteral("api.deepseek.com"))) return {};
+            return _trimmed(model, "apiKey");
+        }
+    }
+    return {};
+}
+
+QString AsrService::_apiKey() const {
+    const auto source = apiKeySource();
+    return source.isEmpty() ? QString() : _apiKeyFrom(source);
+}
+
+QString AsrService::apiKeyHint() const {
+    const auto source = apiKeySource();
+    if (source.isEmpty()) return QStringLiteral("未配置");
+    const auto where = source == QLatin1String("asr")    ? QStringLiteral("本页")
+                     : source == QLatin1String("search") ? QStringLiteral("联网搜索")
+                                                         : QStringLiteral("当前模型");
+    const auto key   = _apiKeyFrom(source);
+    if (key.size() <= 8) return QStringLiteral("已配置（来自%1）").arg(where);
+    return QStringLiteral("已配置（来自%1，…%2）").arg(where, key.right(4));
+}
+
+// ───────────────────────── 接管：会话 ─────────────────────────
+
+bool AsrService::_mayTakeOver(QString& reason) const {
+    reason.clear();
+    // QAudioInput / QTimer 只能在有事件循环的线程里用。厂商如果从别的线程调进来，一律不接管。
+    if (QThread::currentThread() != thread()) {
+        reason = QStringLiteral("语音识别调用不在主线程，已使用有道语音");
+        return false;
+    }
+    if (!mEnabled) return false;                                                // 关闭：静默走厂商路径，不打扰用户
+    if (mVoiceState != VoiceState::Idle || mCapture->capturing()) return false; // 已在会话中：忽略重复启动
+    if (!hasApiKey()) {
+        reason = QStringLiteral("未配置 DeepSeek API Key，已使用有道语音");
+        return false;
+    }
+    return true;
+}
+
+QObject* AsrService::_contextSpeechManager() const {
+    if (!mRootContext) return nullptr;
+    // 宿主把 YSpeechManager 作为 `speechManager` 注入根上下文；YRecordCenter 那条入口拿不到它，
+    // 只能从这里取，否则识别结果没有地方注入。
+    return mRootContext->contextProperty(QStringLiteral("speechManager")).value<QObject*>();
+}
+
+bool AsrService::_speechAssistantEnabled() const {
+    const auto ai = Config::getInstance().read("ai");
+    if (!ai.is_object()) return false;
+    const auto it = ai.find("speech_assistant");
+    return it != ai.end() && it->is_boolean() && it->get<bool>();
+}
+
+bool AsrService::_startSession(QObject* speechManager, bool vendorOwned, QString& reason) {
+    if (!_mayTakeOver(reason)) return false;
+
+    QObject* manager = speechManager ? speechManager : _contextSpeechManager();
+    if (!manager) {
+        reason = QStringLiteral("无法定位系统语音管理器，已使用有道语音");
+        return false;
+    }
+
+    QString captureError;
+    if (!mCapture->start(captureError)) {
+        reason = captureError;
+        return false;
+    }
+
+    mSessionManager     = manager;
+    mSessionVendorOwned = vendorOwned;
+    mPendingManager.clear();
+    mCapture->setSilenceAutoStop(vendorOwned);
+    mSessionClock.start();
+    mSessionDeadline.start(mMaxRecordMs);
+    _setVoiceState(VoiceState::Listening, QStringLiteral("正在聆听…"));
+    info("DeepSeek 语音接管开始（{}，上限 {} ms）", vendorOwned ? "语音助手页" : "键盘语音键", mMaxRecordMs);
+    return true;
+}
+
+bool AsrService::beginVoiceCapture(QObject* speechManager) {
+    try {
+        QString reason;
+        if (!_startSession(speechManager, false, reason)) {
+            if (!reason.isEmpty()) _toast(reason);
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        warn("语音接管异常：{}，回落有道语音", e.what());
+        _abortSession(QStringLiteral("语音接管异常"));
+        return false;
+    } catch (...) {
+        warn("语音接管出现未知异常，回落有道语音");
+        _abortSession(QStringLiteral("语音接管异常"));
+        return false;
+    }
+}
+
+bool AsrService::endVoiceCapture(QObject* speechManager) {
+    try {
+        if (mVoiceState == VoiceState::Idle) return false;
+        if (speechManager && mSessionManager && speechManager != mSessionManager.data()) {
+            // 不是本次会话的管理器，交给厂商自己的收尾逻辑
+            return false;
+        }
+        if (mVoiceState == VoiceState::Recognizing) {
+            // 已经在等结果，再按一次 = 取消
+            _abortSession(QStringLiteral("已取消识别"));
+            return true;
+        }
+        _finishSession();
+        return true;
+    } catch (...) {
+        warn("结束语音接管时出现异常，回落有道语音");
+        return false;
+    }
+}
+
+void AsrService::cancelVoiceCapture() {
+    if (mVoiceState == VoiceState::Idle) return;
+    info("语音接管：会话被取消");
+    _abortSession(QStringLiteral("已取消"));
+}
+
+void AsrService::_finishSession() {
+    if (mVoiceState != VoiceState::Listening) return;
+    mSessionDeadline.stop();
+    mCapture->setSilenceAutoStop(false);
+
+    const int        rate   = mCapture->sampleRate();
+    const QByteArray pcm    = mCapture->stop(); // 已取左声道、单声道
+    QObject*         target = mSessionManager.data();
+    mSessionManager.clear();
+
+    if (pcm.isEmpty()) {
+        warn("语音接管结束：没有录到声音");
+        _setVoiceState(VoiceState::Idle, QStringLiteral("没有录到声音"));
+        _toast(QStringLiteral("没有录到声音，请重试"));
+        if (target) _scheduleStateRecovery(target);
+        return;
+    }
+
+    if (!target) {
+        warn("语音接管结束：语音管理器已失效，结果无处注入");
+        _setVoiceState(VoiceState::Idle, QStringLiteral("语音管理器已失效"));
+        _toast(QStringLiteral("语音管理器已失效，请重试"));
+        return;
+    }
+
+    mPendingManager = target;
+    _setVoiceState(VoiceState::Recognizing, QStringLiteral("正在识别…"));
+    const auto wav = asr::buildWav(pcm, rate, 1);
+    info("语音接管结束：上传 {} 字节 WAV（PCM {} 字节）", wav.size(), pcm.size());
+    // 失败会在 mVoiceClient 的 failed 回调里统一处理（气泡 + 复位状态）
+    mVoiceClient->upload(wav, QStringLiteral("wav"), _apiKey(), mTimeoutMs);
+}
+
+void AsrService::_abortSession(const QString& reason) {
+    mSessionDeadline.stop();
+    mCapture->setSilenceAutoStop(false);
+    mVoiceClient->cancel();
+    mCapture->abort();
+    mSessionManager.clear();
+    mPendingManager.clear();
+    _setVoiceState(VoiceState::Idle, reason);
+}
+
+void AsrService::_setVoiceState(VoiceState state, const QString& status) {
+    const bool activeChanged = (mVoiceState == VoiceState::Idle) != (state == VoiceState::Idle);
+    const bool statusChanged = mVoiceStatus != status;
+    mVoiceState              = state;
+    mVoiceStatus             = status;
+    if (activeChanged || statusChanged) emit voiceChanged();
+}
+
+// ───────────────────────── 接管：结果注入与状态机兜底 ─────────────────────────
+
+void AsrService::_injectResult(QObject* manager, const QString& text) {
+    auto* setAsrResult = PEN_SYM(kSetAsrResult);
+    if (!manager || !setAsrResult) {
+        warn("找不到 YSpeechManager::setAsrResult，无法注入识别结果");
+        _toast(QStringLiteral("无法把识别结果交给系统"));
+        return;
+    }
+    using Setter      = void (*)(void*, const QString&);
+    const auto setter = reinterpret_cast<Setter>(setAsrResult);
+    // 先清空再写入：QML 的 onAsrResultChanged 按"文本是否变化"去重，同一句话连说两次时
+    // 中间清空过一次才会再次触发。KeyBoard::startVoiceInput 进来前也是这么清的。
+    const QString empty;
+    setter(manager, empty);
+    setter(manager, text);
+    info("语音接管：已注入 {} 字", text.size());
+    _scheduleStateRecovery(manager);
+}
+
+int AsrService::_readRecognizing(void* manager) {
+    if (!mRecognizingProbed) {
+        mRecognizingProbed = true;
+        // Q_PROPERTY 的 getter 会作为符号留在 .symtab 里；名字对不上就当作"无法观测"。
+        static const char* candidates[] = {"_ZNK14YSpeechManager11recognizingEv", "_ZN14YSpeechManager11recognizingEv"};
+        for (const auto* symbol : candidates) {
+            mRecognizingGetter = PEN_SYM(symbol);
+            if (mRecognizingGetter) break;
+        }
+        if (!mRecognizingGetter) warn("找不到 YSpeechManager::recognizing，无法观测厂商语音状态");
+    }
+    if (!mRecognizingGetter || !manager) return -1;
+    // 返回类型在符号里看不出来（int 或 ASRState），ARM64 上都走 w0，按 int 读
+    return reinterpret_cast<int (*)(void*)>(mRecognizingGetter)(manager);
+}
+
+bool AsrService::_pushRecognizing(void* manager, int state) {
+    if (!manager) return false;
+    if (!mSetterProbed) {
+        mSetterProbed                   = true;
+        static const char* candidates[] = {
+            "_ZN14YSpeechManager15setRecognizingE9ASRState",
+            "_ZN14YSpeechManager15setRecognizingEi"
+        };
+        for (const auto* symbol : candidates) {
+            mRecognizingSetter = PEN_SYM(symbol);
+            if (mRecognizingSetter) break;
+        }
+    }
+    if (!mRecognizingSetter) return false;
+    reinterpret_cast<void (*)(void*, int)>(mRecognizingSetter)(manager, state);
+    return true;
+}
+
+void AsrService::_scheduleStateRecovery(QObject* manager) {
+    if (!manager) return;
+    QPointer<QObject> guard(manager);
+    QTimer::singleShot(kStateRecoveryDelayMs, this, [this, guard]() {
+        if (!guard) return;
+        const int state = _readRecognizing(guard.data());
+        // -1 = 观测不到，>0 = 确认还卡在识别态
+        if (state <= 0) return;
+        warn("注入文本 {} ms 后厂商语音状态仍为 {}，尝试收尾", kStateRecoveryDelayMs, state);
+        if (_pushRecognizing(guard.data(), 0)) return;
+        // 没有 setter：退回厂商自己的 stop 接口收尾（就是 KeyBoard::stopVoiceInput 用的那个）
+        auto* stopAsrRecord = PEN_SYM(kStopAsrRecord);
+        if (!stopAsrRecord) {
+            warn("既没有 setRecognizing 也没有 stopAsrRecord，无法收尾厂商语音状态");
+            return;
+        }
+        warn("改用 YSpeechManager::stopAsrRecord 收尾");
+        reinterpret_cast<void (*)(void*)>(stopAsrRecord)(guard.data());
+    });
+}
+
+void AsrService::_toast(const QString& text) {
+    if (text.isEmpty()) return;
+    info("提示：{}", text.toStdString());
+    // UI 还没起来（或已销毁）时不要往宿主里打：showToast 依赖 YGlobal 单例，早了会打空指针
+    if (!mRootContext) return;
+    // 同一条提示 2 秒内只弹一次：一次语音操作可能连续经过 startAsrRecord / YRecordCenter::startAsr
+    // 两个入口，否则用户会看到两三条一模一样的气泡。
+    if (text == mLastToastText && mLastToastClock.isValid() && mLastToastClock.elapsed() < 2000) return;
+    mLastToastText = text;
+    mLastToastClock.start();
+    try {
+        showToast(text.toStdString());
+    } catch (...) {
+        warn("气泡提示失败：{}", text.toStdString());
+    }
+}
+
+// ───────────────────────── 接管：hook 安装 ─────────────────────────
+
+void AsrService::_installHooks() {
+    if (mHooksInstalled) return;
+
+    // detour 里再包一层 try/catch：任何异常都必须回到 origin(...)，不能把厂商的语音入口弄丢。
+    static auto startAsrRecordDetour = +[](void* self) {
+        bool handled = false;
+        try {
+            handled = AsrService::getInstance()._onVendorStartAsrRecord(self);
+        } catch (...) {
+            handled = false;
+        }
+        if (handled) return;
+        if (g_startAsrRecordHook.origin) reinterpret_cast<void (*)(void*)>(g_startAsrRecordHook.origin)(self);
+    };
+    static auto stopAsrRecordDetour = +[](void* self) {
+        bool handled = false;
+        try {
+            handled = AsrService::getInstance()._onVendorStopAsrRecord(self);
+        } catch (...) {
+            handled = false;
+        }
+        if (handled) return;
+        if (g_stopAsrRecordHook.origin) reinterpret_cast<void (*)(void*)>(g_stopAsrRecordHook.origin)(self);
+    };
+    const auto install = [](VoiceHook& hook, dobby_dummy_func_t detour) {
+        if (hook.active) return true;
+        hook.target = PEN_SYM(hook.symbol);
+        if (!hook.target) {
+            spdlog::warn("找不到厂商符号 {}，跳过语音接管", hook.symbol);
+            return false;
+        }
+        if (DobbyHook(hook.target, detour, (dobby_dummy_func_t*)&hook.origin) != 0) {
+            spdlog::warn("语音接管 hook 安装失败：{}", hook.symbol);
+            hook.target = nullptr;
+            return false;
+        }
+        hook.active = true;
+        return true;
+    };
+
+    // 与 base/Hook.h 一致：函数指针到 dobby_dummy_func_t 用 C 风格转换（GCC/aarch64 支持）
+    install(g_startAsrRecordHook, (dobby_dummy_func_t)startAsrRecordDetour);
+    install(g_stopAsrRecordHook, (dobby_dummy_func_t)stopAsrRecordDetour);
+
+    mHooksInstalled = g_startAsrRecordHook.active || g_stopAsrRecordHook.active;
+    if (mHooksInstalled) info("DeepSeek 语音接管已安装 hook");
+}
+
+void AsrService::_removeHooks() {
+    const auto remove = [](VoiceHook& hook) {
+        if (!hook.active || !hook.target) return;
+        if (DobbyDestroy(hook.target) != 0) {
+            // 还原失败时行为仍然正确：detour 留在原地，但 _onVendor* 在关闭后一律返回 false，
+            // 等于原样透传给 origin(...)。
+            spdlog::warn("语音接管 hook 还原失败：{}", hook.symbol);
+        }
+        hook.active = false;
+    };
+    remove(g_startAsrRecordHook);
+    remove(g_stopAsrRecordHook);
+    mHooksInstalled = false;
+    info("DeepSeek 语音接管已移除 hook");
+}
+
+bool AsrService::_onVendorStartAsrRecord(void* manager) {
+    if (!mEnabled) return false;
+    // 这条入口只有厂商自己会走（键盘语音键在 KeyBoard 里就分流出去了），也就是语音助手页 /
+    // 长按语音。它的识别结果只有"语音助手"开启才会流向聊天页；关闭时那一页靠原厂的语义指令
+    // 解析（speechManager.content）工作，我们无法复现，所以那种情况下原样交给厂商。
+    if (!_speechAssistantEnabled()) return false;
+    if (mVoiceState != VoiceState::Idle) {
+        // 已经有一次会话在跑：把这次的启动吞掉，避免第二路麦克风采集
+        debug("已有语音会话，忽略重复的 startAsrRecord");
+        return true;
+    }
+    QString reason;
+    if (!_startSession(reinterpret_cast<QObject*>(manager), true, reason)) {
+        if (!reason.isEmpty()) _toast(reason);
+        return false; // 回落厂商路径
+    }
+    return true;
+}
+
+bool AsrService::_onVendorStopAsrRecord(void* manager) {
+    if (mVoiceState == VoiceState::Idle) return false;
+    if (manager && mSessionManager && mSessionManager.data() != reinterpret_cast<QObject*>(manager)) return false;
+    if (mVoiceState == VoiceState::Recognizing) {
+        // 已经在等结果，多余的 stop 直接吃掉（再走厂商 stop 会把状态机提前推回 idle）
+        return true;
+    }
+    _finishSession();
+    return true;
+}
+
+bool AsrService::onRecordCenterStartAsr(void* recordCenter) {
+    if (!mEnabled) return false;
+    // 同 _onVendorStartAsrRecord：只接管"文本会被送到聊天页"的语音助手场景。
+    if (!_speechAssistantEnabled()) return false;
+    if (mVoiceState != VoiceState::Idle) {
+        debug("已有语音会话，忽略重复的 YRecordCenter::startAsr");
+        return true;
+    }
+    QString reason;
+    if (!_startSession(_contextSpeechManager(), true, reason)) {
+        if (!reason.isEmpty()) _toast(reason);
+        return false;
+    }
+    return true;
+}
+
+} // namespace mod
