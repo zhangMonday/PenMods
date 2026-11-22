@@ -162,8 +162,10 @@ void AsrService::_transcribeSetStatus(const QString& status, const QString& prog
 // ───────────────────────── 输入处理 ─────────────────────────
 
 void AsrService::_transcribeDirect(const QString& path) {
-    const QFileInfo info(path);
-    const auto      suffix = info.suffix().toLower();
+    // 注意：局部变量不能叫 info —— 本类继承 Logger，Logger::info() 是写日志用的，
+    // 同名局部量会让后面 info("...") 这类日志调用解析到 QFileInfo 上。
+    const QFileInfo fileInfo(path);
+    const auto      suffix = fileInfo.suffix().toLower();
 
     if (suffix == QLatin1String("wav")) {
         QFile file(path);
@@ -186,7 +188,7 @@ void AsrService::_transcribeDirect(const QString& path) {
 
     if (suffix == QLatin1String("ogg") || suffix == QLatin1String("opus")) {
         const double duration = oggDurationSeconds(path);
-        if (info.size() <= kDirectBytes && duration > 0 && duration <= kSegmentSeconds) {
+        if (fileInfo.size() <= kDirectBytes && duration > 0 && duration <= kSegmentSeconds) {
             // 整段可直接用（接口原生支持 Ogg Opus）
             mSegmentSource     = path;
             mSegmentSuffix     = QStringLiteral("ogg");
@@ -194,13 +196,13 @@ void AsrService::_transcribeDirect(const QString& path) {
             mSegmentOffsets.clear();
             mSegmentBytes.clear();
             mSegmentOffsets << 0;
-            mSegmentBytes << info.size();
+            mSegmentBytes << fileInfo.size();
             mSegmentTotal = 1;
             mSegmentIndex = 0;
             _uploadNextSegment();
             return;
         }
-        info("Ogg 超过单次请求限制（{} 字节 / {} 秒），转码后分段", info.size(), duration);
+        info("Ogg 超过单次请求限制（{} 字节 / {} 秒），转码后分段", fileInfo.size(), duration);
         _transcribeTranscode(path);
         return;
     }
@@ -220,7 +222,7 @@ void AsrService::_transcribeTranscode(const QString& path) {
     auto* process = new QProcess(this);
     mTranscode    = process;
     process->setProcessChannelMode(QProcess::MergedChannels);
-    connect(process, &QProcess::finished, this, [this, process](int code, QProcess::ExitStatus status) {
+    connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this, process](int code, QProcess::ExitStatus status) {
         if (mTranscode != process) return;
         mTranscode.clear();
         mTranscodeDeadline.stop();
@@ -326,8 +328,9 @@ void AsrService::_transcribePlanWav(const QString& wavPath) {
 /// （16000 Hz / 单声道 / s16），所以这里按这个格式把整文件当数据块处理，切片时再套 WAV 头 ——
 /// 比让整条链路因为少 44 字节而失败要好得多。
 void AsrService::_transcribePlanRaw(const QString& pcmPath) {
-    const QFileInfo info(pcmPath);
-    if (!info.exists() || info.size() <= 0) {
+    // 同 _transcribeDirect：局部量不能与 Logger::info 同名。
+    const QFileInfo fileInfo(pcmPath);
+    if (!fileInfo.exists() || fileInfo.size() <= 0) {
         _transcribeFail(QStringLiteral("转码没有产生音频数据"));
         return;
     }
@@ -335,7 +338,7 @@ void AsrService::_transcribePlanRaw(const QString& pcmPath) {
     mSegmentSuffix     = QStringLiteral("wav");
     mSegmentDirectFile = false;
     info("音频转文字：转码输出没有 WAV 头，按 16 kHz 单声道裸 PCM 处理");
-    _transcribePlanRange(0, info.size(), 16000, 1);
+    _transcribePlanRange(0, fileInfo.size(), 16000, 1);
 }
 
 /// 按给定的数据范围切片：每片同时满足"≤110 秒"和"≤6 MiB"，并严格对齐到采样帧边界

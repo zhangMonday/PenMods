@@ -251,7 +251,7 @@ PEN_HOOK(uint64, _ZN13YRecordCenter8startAsrEv, uint64 self, void* a2, void* a3,
     // 万一我们的 detour 把这条保护顶掉，录音期间厂商录音就挡不住了。
     // 关闭时 onRecordCenterStartAsr() 立刻返回 false，下面的原逻辑一行都不变。
     try {
-        if (mod::AsrService::getInstance().onRecordCenterStartAsr(self)) {
+        if (mod::AsrService::getInstance().onRecordCenterStartAsr(reinterpret_cast<void*>(self))) {
             // 已接管：自己录音，返回一个自增的"录音序号"，语义与本 hook 下面挡住厂商录音时一致
             return ++*((uint64*)self + 14);
         }
